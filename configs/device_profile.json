@@ -1,0 +1,7 @@
+{
+  "_说明": "rack_count：导轨层数（层位 0 = 底板层，1..rack_count = 导轨层）；floor_usable=false 的机型不能直接放底板；cavity_group 相同表示内腔完全相同，检索结果以 cavity_group 为准；accessories 为该型号支持的附件，null 表示尚未配置（推理时不做附件屏蔽），[] 表示不支持任何附件。floor_usable、cavity_group、accessories 目前是占位值，需要按实际机型填写；C87-i7Pro 的 accessories 取自 data/model/0904 标注中实际出现的附件。",
+  "C9277A":    {"rack_count": 5, "floor_usable": true, "cavity_group": "G5A", "accessories": ["烤盘", "小炸篮"]},
+  "CQ09-i9":   {"rack_count": 3, "floor_usable": true, "cavity_group": "G3A", "accessories": null},
+  "C87-i7Pro": {"rack_count": 5, "floor_usable": true, "cavity_group": "G5B", "accessories": ["微波专用烤架", "小炸篮", "烤盘"]},
+  "DB677":     {"rack_count": 2, "floor_usable": true, "cavity_group": "G2A", "accessories": null}
+}

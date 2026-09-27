@@ -3,23 +3,72 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Loss", ("train_loss", "val_loss")),
+    (
+        "Train loss terms",
+        (
+            "train_loss_is_oven",
+            "train_loss_proj",
+            "train_loss_food",
+            "train_loss_container",
+            "train_loss_accessory",
+            "train_loss_rack",
+        ),
+    ),
+    (
+        "Val metrics",
+        (
+            "val_is_oven_acc",
+            "val_food_acc",
+            "val_container_map",
+            "val_accessory_map",
+            "val_rack_acc",
+            "val_rack_acc_pm1",
+            "val_device_top1_proj",
+            "val_device_top1_raw",
+        ),
+    ),
+    (
+        "Grad norm",
+        (
+            "train_gn_is_oven",
+            "train_gn_proj",
+            "train_gn_food",
+            "train_gn_container",
+            "train_gn_accessory",
+            "train_gn_rack",
+            "train_gn_backbone",
+        ),
+    ),
+    ("Score", ("score",)),
+    ("LR", ("lr",)),
+)
 
 
 class TrainingMonitor:
     """记录每轮指标，并保存 JSON 与训练曲线。"""
 
-    def __init__(self, output_dir: str | Path) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        groups: Sequence[tuple[str, Sequence[str]]] = DEFAULT_GROUPS,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.groups = groups
         self.history: list[dict[str, float | int]] = []
 
-    def update(self, epoch: int, metrics: Mapping[str, float | int]) -> None:
+    def update(self, epoch: int, metrics: Mapping[str, float | int | None]) -> None:
         epoch_number = int(epoch) + 1
         record: dict[str, float | int] = {"epoch": epoch_number}
         for name, value in metrics.items():
+            if value is None:
+                continue
             record[str(name)] = int(value) if isinstance(value, int) else float(value)
 
         self.history = [item for item in self.history if int(item["epoch"]) != epoch_number]
@@ -58,48 +107,22 @@ class TrainingMonitor:
         import matplotlib.pyplot as plt
 
         epochs = [int(item["epoch"]) for item in self.history]
-        groups = [
-            (
-                "Loss",
-                [
-                    "train_loss",
-                    "val_loss",
-                    "train_seg_loss",
-                    "val_seg_loss",
-                    "train_cls_loss",
-                    "val_cls_loss",
-                    "train_ce",
-                    "val_ce",
-                    "train_dice",
-                    "val_dice",
-                ],
-            ),
-            (
-                "Segmentation",
-                ["val_miou", "val_iou", "val_fg_iou", "val_pixel_acc"],
-            ),
-            (
-                "Classification",
-                ["train_top1", "val_top1", "val_top5"],
-            ),
-            (
-                "Score",
-                ["score"],
-            ),
-        ]
-
-        figure, axes = plt.subplots(2, 2, figsize=(14, 9))
-        for axis, (title, names) in zip(axes.flat, groups):
+        cols = 3
+        rows = (len(self.groups) + cols - 1) // cols
+        figure, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows), squeeze=False)
+        for axis, (title, names) in zip(axes.flat, self.groups):
             for name in names:
                 values = [item.get(name) for item in self.history]
                 if any(value is not None for value in values):
-                    axis.plot(epochs, values, marker="o", label=name)
+                    axis.plot(epochs, values, marker="o", markersize=3, label=name)
             axis.set_title(title)
             axis.set_xlabel("epoch")
             axis.grid(alpha=0.3)
             if axis.lines:
-                axis.legend()
+                axis.legend(fontsize=8)
+        for axis in list(axes.flat)[len(self.groups):]:
+            axis.axis("off")
 
         figure.tight_layout()
-        figure.savefig(self.output_dir / "training_curves.png", dpi=150)
+        figure.savefig(self.output_dir / "training_curves.png", dpi=120)
         plt.close(figure)

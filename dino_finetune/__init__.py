@@ -6,13 +6,16 @@ from typing import Any
 
 _LAZY_IMPORTS = {
     "LoRA": ("dino_finetune.model.lora", "LoRA"),
-    "DINOEncoderLoRA": ("dino_finetune.model.dino", "DINOEncoderLoRA"),
-    "LinearClassifier": ("dino_finetune.model.linear_decoder", "LinearClassifier"),
-    "FPNDecoder": ("dino_finetune.model.fpn_decoder", "FPNDecoder"),
-    "get_dataloader": ("dino_finetune.data", "get_dataloader"),
-    "visualize_overlay": ("dino_finetune.visualization", "visualize_overlay"),
-    "compute_iou_metric": ("dino_finetune.metrics", "compute_iou_metric"),
-    "get_corruption_transforms": ("dino_finetune.corruption", "get_corruption_transforms"),
+    "OvenMultiTaskModel": ("dino_finetune.model.oven", "OvenMultiTaskModel"),
+    "OvenDataset": ("dino_finetune.data", "OvenDataset"),
+    "OvenTransforms": ("dino_finetune.data", "OvenTransforms"),
+    "OvenLabel": ("dino_finetune.labels", "OvenLabel"),
+    "LabelSchema": ("dino_finetune.labels", "LabelSchema"),
+    "load_split": ("dino_finetune.labels", "load_split"),
+    "DeviceSpec": ("dino_finetune.device", "DeviceSpec"),
+    "DeviceGallery": ("dino_finetune.device", "DeviceGallery"),
+    "load_device_profile": ("dino_finetune.device", "load_device_profile"),
+    "MultiTaskLoss": ("dino_finetune.losses", "MultiTaskLoss"),
 }
 
 __all__ = list(_LAZY_IMPORTS)

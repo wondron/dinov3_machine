@@ -1,0 +1,133 @@
+# 一体机多任务视觉识别 · 默认训练配置
+# 设计文档：docs/oven-multitask-design.md（v2）
+# 相对路径均以项目根目录为基准
+
+# =========================
+# 骨干与各任务头
+# =========================
+model:
+  dino_type: dinov3
+  size: large                          # ViT-L/16，1024 维
+  dino_local_repo: third_party/dinov3
+  weight_path: data/model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  max_rack: 8                          # MAX_RACK；层位输出 max_rack + 1 类（0 = 底板层，1..N = 导轨层）
+  attn_pool_heads: 8                   # 每个头独立的 attention pooling
+  head_hidden_dim: 512
+  head_dropout: 0.1
+  proj_hidden_dim: 512                 # Proj Head：1024 → 512 → 256，输出 L2 归一化
+  proj_dim: 256
+  # 阶段 4（可选）：效果不够时再放开骨干，并用 --init 加载阶段 1 的 ckpt_best.pt
+  # 骨干一旦变动，特征库和各项阈值会在训练结束时自动重建、重新标定
+  unfreeze_last_n_blocks: 0
+  use_lora: false
+  lora_rank: 8
+
+# =========================
+# 类别表：顺序就是多标签向量的编码顺序，训练后不要改动
+# =========================
+labels:
+  container: [玻璃容器, 塑料容器, 陶瓷容器, 金属容器, 泡沫容器, 木竹容器, 纸质容器, 油纸, 保鲜膜, 铝箔]
+  accessory: [玻璃蒸烤盘, 脆烤盘, 微波专用烤架, 烤架, 炸烤网架, 烤盘, 有孔蒸盘, 无孔蒸盘, 小炸篮]
+  safety_container: [金属容器, 铝箔, 泡沫容器]   # 按召回率目标定阈值
+  none_tokens: ["无"]                  # 列表里出现视为空列表；device_model / rack_level / food_name 出现视为 null / 无
+
+# 设备配置表：rack_count、floor_usable、cavity_group、支持的附件
+device_profile: configs/device_profile.json
+
+# =========================
+# 数据：<root>/<split>/*.json，每个 JSON 旁边放同名图片
+# =========================
+data:
+  root: data/model/0904                # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
+  train_split: train
+  val_split: val
+  test_split: test                     # 留空则不做测试集评估
+  on_error: raise                      # 标注硬错误（类别不在类别表、层位越界、型号不在配置表、图片缺失等）：raise 报错 / skip 跳过该样本
+  strict: false                        # true 时规范类警告（如有物品但层位为空）也按硬错误处理
+
+input:
+  img_dim: [288, 512]                  # (H, W)，必须能被 16 整除；原图 720x1280，保持 16:9
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  img_interp: linear
+  # 一体机场景的增强约束：不上下翻转、不做旋转、不大幅竖直平移、裁剪不能切掉底板和导轨
+  train_aug:
+    enabled: true
+    max_crop_frac: 0.05                # 四条边各自随机裁掉 0～5%
+    hflip_p: 0.5                       # 左右翻转
+    color_jitter_p: 0.8
+    brightness: 0.3                    # 覆盖灯亮 / 灯暗
+    contrast: 0.2
+    saturation: 0.15
+    hue: 0.02
+
+# =========================
+# 采样
+# =========================
+sampler:
+  type: pk                             # pk：每个 batch 取 P 个型号 × K 张，各型号（cavity_group）等概率；random：普通打乱
+  p_groups: 4                          # 型号数不足 P 时取全部
+  non_oven_ratio: 0.25                 # 每个 batch 中非一体机图片的占比；数据里没有非一体机图片时自动为 0
+
+# =========================
+# Loss
+# =========================
+loss:
+  weights:
+    is_oven: 0.5
+    proj: 1.0
+    food: 0.5
+    container: 1.0
+    accessory: 1.0
+    rack: 1.0
+  metric: supcon                       # 型号特征的度量学习：supcon / arcface（只用一体机样本，按 cavity_group 区分）
+  supcon_temperature: 0.1
+  arcface_scale: 30.0
+  arcface_margin: 0.3
+  multilabel: bce                      # 容器、附件头：bce / focal
+  focal_gamma: 2.0
+  pos_weight: auto                     # auto：按训练集正负样本比例计算；none：不加权
+  pos_weight_max: 10.0
+  rack_smoothing: 0.0                  # 邻层软标签，只在导轨层之间平滑；0 为普通 CE
+
+# =========================
+# 训练
+# =========================
+trainparams:
+  epochs: 30
+  batch_size: 16
+  steps_per_epoch: 0                   # 0：按 ceil(训练样本数 / batch_size)
+  num_workers: 4
+  num_workers_eval: 2
+  lr: 3.0e-4                           # 各任务头
+  lr_backbone: 1.0e-5                  # 解冻的 block / LoRA
+  weight_decay: 0.05
+  min_lr: 1.0e-6
+  warmup_steps: 50
+  use_amp: true                        # 仅在 CUDA 上生效
+  grad_clip: 1.0                       # 逐头裁剪的梯度范数上限（各头互不影响）；<= 0 表示不裁剪
+  log_every: 10
+  seed: 42
+
+# =========================
+# 验证、特征库与阈值标定（阶段 2）
+# =========================
+eval:
+  gallery_max_per_model: 200           # 每个型号最多从训练集取多少张参考图建特征库
+  gallery_feature: proj                # 型号检索用的特征：proj（Proj Head）/ raw（DINOv3 CLS），两种都会评估
+  knn_k: 10
+  tau: 0.5                             # 未知型号阈值默认值；特征库有 2 个以上 cavity_group 时由阶段 2 标定覆盖
+  default_threshold: 0.5               # 多标签 / 二分类阈值默认值
+  safety_recall_target: 0.95           # 安全相关容器类别的召回率目标
+  rack_target_precision: 0.95          # 层位置信度阈值：高于阈值的预测要达到的准确率
+  score_weights:                       # 选 ckpt_best 的综合分（验证集指标加权平均，缺失的指标自动跳过；综合分持平时取验证 loss 更低的）
+    rack_acc: 1.0
+    accessory_map: 1.0
+    container_map: 1.0
+    device_top1: 1.0
+    is_oven_acc: 0.5
+    food_acc: 0.5
+  run_test: true                       # 训练结束后用标定好的阈值评估测试集
+
+output:
+  root: output/oven                    # 每次训练输出到 <root>/<YYMMDD_HHMMSS>/

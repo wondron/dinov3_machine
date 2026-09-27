@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -130,25 +132,34 @@ def build_encoder(
     backbone_name = backbones[size]
     logger.info("加载 DINO encoder：%s", backbone_name)
 
-    try:
-        encoder = torch.hub.load(
-            repo_or_dir=dino_local_repo,
-            model=backbone_name,
-            source="local",
-            pretrained=False,
-        ).to(device)
-    except TypeError:
-        encoder = torch.hub.load(
-            repo_or_dir=dino_local_repo,
-            model=backbone_name,
-            source="local",
-        ).to(device)
+    hub_backbones = Path(dino_local_repo) / dino_type / "hub" / "backbones.py"
+    if hub_backbones.is_file():
+        # 直接从 <repo>/<dino_type>/hub/backbones.py 构建骨干：hubconf.py 会顺带导入分割、检测等模块，
+        # 需要 torchmetrics 等只做训练骨干时用不到的依赖
+        if str(dino_local_repo) not in sys.path:
+            sys.path.insert(0, str(dino_local_repo))
+        module = importlib.import_module(f"{dino_type}.hub.backbones")
+        encoder = getattr(module, backbone_name)(pretrained=False).to(device)
+    else:
+        try:
+            encoder = torch.hub.load(
+                repo_or_dir=dino_local_repo,
+                model=backbone_name,
+                source="local",
+                pretrained=False,
+            ).to(device)
+        except TypeError:
+            encoder = torch.hub.load(
+                repo_or_dir=dino_local_repo,
+                model=backbone_name,
+                source="local",
+            ).to(device)
 
     weight_path = Path(weight_path)
     if not weight_path.is_file():
         raise FileNotFoundError(f"权重文件不存在：{weight_path}")
 
-    ckpt = torch.load(str(weight_path), map_location="cpu")
+    ckpt = torch.load(str(weight_path), map_location="cpu", weights_only=True)
     ckpt_sd = pick_state_dict(ckpt)
     auto_align_and_load(encoder, ckpt_sd)
 

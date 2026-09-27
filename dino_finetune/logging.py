@@ -1,10 +1,12 @@
-# utils/logging.py
+# dino_finetune/logging.py
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 
 _SHANGHAI_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+_DATE_FORMAT = "%m-%d %H:%M:%S"
 
 
 class _ShanghaiFormatter(logging.Formatter):
@@ -24,50 +26,28 @@ def setup_logging(
     use_shanghai_time: bool = False,
 ) -> logging.Logger:
     """
-    统一日志初始化函数
+    统一日志初始化：handler 挂在 root logger 上，各模块的 logger 通过传播共用同一份输出（终端 + 可选日志文件）。
+    重复调用会替换旧 handler，例如确定输出目录之后再补上日志文件。
     """
-    # ===== 1. 先保证 root logger 有 handler（兜底，debug 必须）=====
+    formatter_cls = _ShanghaiFormatter if use_shanghai_time else logging.Formatter
+    fmt = formatter_cls(fmt=_FORMAT, datefmt=_DATE_FORMAT)
+
     root = logging.getLogger()
     root.setLevel(level)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()
 
-    if not root.handlers:
-        formatter_cls = _ShanghaiFormatter if use_shanghai_time else logging.Formatter
-        root_fmt = formatter_cls(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%m-%d %H:%M:%S",
-        )
-        rh = logging.StreamHandler()
-        rh.setLevel(level)
-        rh.setFormatter(root_fmt)
-        root.addHandler(rh)
-
-    # ===== 2. 再配置你自己的 app logger =====
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-
-    # 命名 logger 已有自己的 handler，关闭向 root 传播，避免同一条日志重复输出。
-    logger.propagate = False
-
-    formatter_cls = _ShanghaiFormatter if use_shanghai_time else logging.Formatter
-    fmt = formatter_cls(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%m-%d %H:%M:%S",
-    )
-
-    # 清理旧 handler
-    if logger.handlers:
-        for h in list(logger.handlers):
-            logger.removeHandler(h)
-
-    sh = logging.StreamHandler()
-    sh.setLevel(level)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    root.addHandler(stream_handler)
 
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setLevel(level)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
 
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = True
     return logger
