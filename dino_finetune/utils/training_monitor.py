@@ -30,7 +30,7 @@ DEFAULT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "val_rack_acc",
             "val_rack_acc_pm1",
             "val_device_top1_proj",
-            "val_device_top1_raw",
+            "val_device_top1_cls",
         ),
     ),
     (
@@ -42,7 +42,7 @@ DEFAULT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "train_gn_container",
             "train_gn_accessory",
             "train_gn_rack",
-            "train_gn_backbone",
+            "train_gn_lora",
         ),
     ),
     ("Score", ("score",)),

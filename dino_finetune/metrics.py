@@ -12,7 +12,7 @@ import torch
 from .device import DeviceGallery, DeviceSpec, GalleryMatch, calibrate_tau
 from .labels import OvenLabel
 
-FEATURE_KEYS = {"proj": "proj", "raw": "cls"}  # 检索特征名 → collect 出来的数组名
+FEATURE_KEYS = ("proj", "cls")  # 型号检索特征：Proj Head 输出 / 骨干 CLS（数组名与特征名相同）
 
 
 # -----------------------------
@@ -287,7 +287,7 @@ def evaluate_outputs(
     for name, gallery in galleries.items():
         if len(gallery) == 0 or len(oven_rows) == 0:
             continue
-        feats = torch.from_numpy(arrays[FEATURE_KEYS[name]][oven_rows])
+        feats = torch.from_numpy(arrays[name][oven_rows])
         matches = gallery.query_batch(feats, k=calibration["knn_k"], tau=calibration["tau"][name])
         result = retrieval_report(matches, [models[i] for i in oven_rows], gallery)
         report[f"device_{name}"] = result
@@ -411,7 +411,7 @@ def calibrate_thresholds(
     for name, gallery in galleries.items():
         result = None
         if len(gallery) and len(oven_rows):
-            result = calibrate_tau(gallery, torch.from_numpy(arrays[FEATURE_KEYS[name]][oven_rows]), models)
+            result = calibrate_tau(gallery, torch.from_numpy(arrays[name][oven_rows]), models)
         if result is None:
             sources[f"tau/{name}"] = "default(需要 2 个以上 cavity_group)"
         else:

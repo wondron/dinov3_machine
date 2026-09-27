@@ -201,9 +201,9 @@ def _validate_model(model: dict[str, Any]) -> None:
     _float(model, "head_dropout", ctx, default=0.0, lo=0.0, hi=1.0, hi_open=True)
     _int(model, "proj_hidden_dim", ctx, default=512, lo=1)
     _int(model, "proj_dim", ctx, default=256, lo=1)
-    _int(model, "unfreeze_last_n_blocks", ctx, default=0, lo=0)
-    _bool(model, "use_lora", ctx, default=False)
+    _bool(model, "use_lora", ctx, default=True)
     _int(model, "lora_rank", ctx, default=8, lo=1)
+    _int(model, "lora_last_n_blocks", ctx, default=0, lo=0)
 
 
 def _validate_labels(labels: dict[str, Any]) -> None:
@@ -235,6 +235,7 @@ def _validate_data(data: dict[str, Any]) -> None:
     data["test_split"] = test_split.strip() if isinstance(test_split, str) and test_split.strip() else None
     _choice(data, "on_error", ctx, ("raise", "skip"), default="raise")
     _bool(data, "strict", ctx, default=False)
+    _str_list(data, "exclude_groups", ctx, default=[], allow_empty=True)
 
 
 def _validate_input(inp: dict[str, Any]) -> None:
@@ -311,7 +312,7 @@ def _validate_trainparams(tp: dict[str, Any]) -> None:
     _int(tp, "num_workers", ctx, default=4, lo=0)
     _int(tp, "num_workers_eval", ctx, default=2, lo=0)
     lr = _float(tp, "lr", ctx, lo=0.0, lo_open=True)
-    _float(tp, "lr_backbone", ctx, default=1.0e-5, lo=0.0, lo_open=True)
+    _float(tp, "lr_lora", ctx, default=1.0e-4, lo=0.0, lo_open=True)
     _float(tp, "weight_decay", ctx, default=0.05, lo=0.0)
     min_lr = _float(tp, "min_lr", ctx, default=0.0, lo=0.0)
     if min_lr > lr:
@@ -326,7 +327,7 @@ def _validate_trainparams(tp: dict[str, Any]) -> None:
 def _validate_eval(ev: dict[str, Any]) -> None:
     ctx = "eval"
     _int(ev, "gallery_max_per_model", ctx, default=200, lo=1)
-    _choice(ev, "gallery_feature", ctx, ("proj", "raw"), default="proj")
+    _choice(ev, "gallery_feature", ctx, ("proj", "cls"), default="proj")
     _int(ev, "knn_k", ctx, default=10, lo=1)
     _float(ev, "tau", ctx, default=0.5, lo=-1.0, hi=1.0)
     _float(ev, "default_threshold", ctx, default=0.5, lo=0.0, hi=1.0, lo_open=True, hi_open=True)
@@ -344,6 +345,14 @@ def _validate_eval(ev: dict[str, Any]) -> None:
     if not any(v > 0 for v in weights.values()):
         raise ValueError("eval.score_weights 至少要有一项大于 0")
     _bool(ev, "run_test", ctx, default=True)
+    _bool(ev, "run_stage2", ctx, default=True)
+
+
+def _validate_loo(loo: dict[str, Any]) -> None:
+    ctx = "loo"
+    _int(loo, "epochs", ctx, default=0, lo=0)
+    _float(loo, "holdout_frac", ctx, default=0.3, lo=0.0, hi=1.0, lo_open=True, hi_open=True)
+    _int(loo, "min_group_images", ctx, default=4, lo=2)
 
 
 def validate_config(cfg: dict[str, Any]) -> None:
@@ -356,6 +365,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
     _validate_loss(_section(cfg, "loss"))
     _validate_trainparams(_section(cfg, "trainparams"))
     _validate_eval(_section(cfg, "eval", optional=True))
+    _validate_loo(_section(cfg, "loo", optional=True))
     _str(_section(cfg, "output", optional=True), "root", "output", default="output/oven")
 
 

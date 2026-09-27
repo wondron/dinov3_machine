@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -196,10 +197,10 @@ def calibrate_tau(
     models: Sequence[str],
 ) -> dict[str, Any] | None:
     """
-    标定未知型号阈值 tau（设计文档 4.3）：
+    快速标定未知型号阈值 tau（训练结束时的默认做法）：
       - 库内：验证集图片对完整特征库的 top-1 相似度，应当接受；
       - 库外：把图片所属 cavity_group 从特征库里临时拿掉后的 top-1 相似度，应当拒识。
-    取两类平衡准确率最高的阈值。这是留一型号验证的近似（Proj Head 训练时见过该型号）；
+    这是留一型号验证的近似（模型训练时见过该型号）；完整做法见 script/4-留一型号验证.py。
     特征库不足 2 个 cavity_group 时无法标定，返回 None。
     """
     groups = sorted({gallery.group(m) for m in gallery.labels})
@@ -215,23 +216,26 @@ def calibrate_tau(
         idx = [i for i in in_idx if gallery.group(models[i]) == group]
         if idx:
             s_out.append(gallery.without_group(group).top1_similarity(feats[idx]))
-    s_out = torch.cat(s_out)
+    return choose_tau(s_in.numpy(), torch.cat(s_out).numpy())
 
-    values = torch.cat([s_in, s_out]).unique(sorted=True)
-    candidates = torch.cat([values[:1] - 1e-4, (values[1:] + values[:-1]) / 2, values[-1:] + 1e-4])
-    best: tuple[float, float, float, float] | None = None
-    for tau in candidates.tolist():
-        accept_in = float((s_in >= tau).float().mean())
-        reject_out = float((s_out < tau).float().mean())
-        balanced = 0.5 * (accept_in + reject_out)
-        if best is None or balanced > best[0]:
-            best = (balanced, tau, accept_in, reject_out)
-    assert best is not None
+
+def choose_tau(s_in: np.ndarray, s_out: np.ndarray) -> dict[str, Any]:
+    """
+    s_in：库内型号图片的 top-1 相似度（应当接受）；s_out：库外型号图片的 top-1 相似度（应当拒识为未知型号）。
+    取两者平衡准确率最高的阈值，阈值落在相邻两个相似度的中点。
+    """
+    s_in, s_out = np.asarray(s_in, dtype=np.float64), np.asarray(s_out, dtype=np.float64)
+    values = np.unique(np.concatenate([s_in, s_out]))
+    candidates = np.concatenate([values[:1] - 1e-4, (values[1:] + values[:-1]) / 2, values[-1:] + 1e-4])
+    accept_in = (s_in[None, :] >= candidates[:, None]).mean(1)
+    reject_out = (s_out[None, :] < candidates[:, None]).mean(1)
+    balanced = 0.5 * (accept_in + reject_out)
+    best = int(np.argmax(balanced))
     return {
-        "tau": float(best[1]),
-        "balanced_acc": best[0],
-        "in_accept_rate": best[2],
-        "out_reject_rate": best[3],
+        "tau": float(candidates[best]),
+        "balanced_acc": float(balanced[best]),
+        "in_accept_rate": float(accept_in[best]),
+        "out_reject_rate": float(reject_out[best]),
         "n_in": int(len(s_in)),
         "n_out": int(len(s_out)),
     }

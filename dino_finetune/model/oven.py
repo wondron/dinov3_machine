@@ -2,19 +2,38 @@
 """一体机多任务视觉识别模型（设计文档第 2、4 节）。"""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lora import inject_lora
+from .lora import LoRA, inject_lora
 
 logger = logging.getLogger(__name__)
 
 POOLED_HEADS = ("is_oven", "food", "container", "accessory")
+# 推理 / ONNX 导出统一的输出（顺序即 ONNX 输出顺序）
+OUTPUT_KEYS = ("is_oven_prob", "food_prob", "container_prob", "accessory_prob", "rack_raw", "proj", "cls")
+
+
+def inference_outputs(out: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    把 forward 输出整理成推理输出：四个分类头的 sigmoid 概率、未掩码的层位 logits
+    （推理时型号由检索得到，层数掩码在后处理里做）、proj 与 cls 特征。
+    """
+    return {
+        "is_oven_prob": torch.sigmoid(out["is_oven"].float()),
+        "food_prob": torch.sigmoid(out["food"].float()),
+        "container_prob": torch.sigmoid(out["container"].float()),
+        "accessory_prob": torch.sigmoid(out["accessory"].float()),
+        "rack_raw": out["rack_raw"].float(),
+        "proj": out["proj"].float(),
+        "cls": out["cls"].float(),
+    }
 
 
 class AttnPool(nn.Module):
@@ -85,7 +104,7 @@ class OvenMultiTaskModel(nn.Module):
       ├─ Is-Oven / Food / Container / Accessory：各自独立的 attention pooling + MLP
       ├─ Rack：attention pooling + MLP，按真实（或检索到的）型号的 rack_count / floor_usable 掩码
       └─ Proj：CLS → MLP → L2 归一化特征，用于检索特征库
-    骨干默认全部冻结（阶段 1）；阶段 4 可以解冻最后 N 个 block 或注入 LoRA。骨干始终处于 eval 模式。
+    骨干预训练权重冻结，用 LoRA（Q、V 低秩增量）微调；use_lora=False 时骨干完全冻结。骨干始终处于 eval 模式。
     """
 
     def __init__(
@@ -100,9 +119,9 @@ class OvenMultiTaskModel(nn.Module):
         dropout: float = 0.0,
         proj_hidden_dim: int = 512,
         proj_dim: int = 256,
-        unfreeze_last_n_blocks: int = 0,
-        use_lora: bool = False,
+        use_lora: bool = True,
         lora_rank: int = 8,
+        lora_last_n_blocks: int = 0,
     ) -> None:
         super().__init__()
         dim = int(getattr(encoder, "num_features", 0) or 0)
@@ -115,16 +134,7 @@ class OvenMultiTaskModel(nn.Module):
 
         for p in self.encoder.parameters():
             p.requires_grad = False
-        if unfreeze_last_n_blocks > 0:
-            blocks = list(self.encoder.blocks)
-            for block in blocks[-unfreeze_last_n_blocks:]:
-                block.requires_grad_(True)
-            for name in ("norm", "cls_norm"):
-                module = getattr(self.encoder, name, None)
-                if isinstance(module, nn.Module):
-                    module.requires_grad_(True)
-        if use_lora:
-            inject_lora(self.encoder, lora_rank)
+        self.lora_blocks = inject_lora(self.encoder, lora_rank, lora_last_n_blocks) if use_lora else 0
         self.backbone_trainable = any(p.requires_grad for p in self.encoder.parameters())
 
         self.heads = nn.ModuleDict(
@@ -162,9 +172,9 @@ class OvenMultiTaskModel(nn.Module):
             dropout=model_cfg["head_dropout"],
             proj_hidden_dim=model_cfg["proj_hidden_dim"],
             proj_dim=model_cfg["proj_dim"],
-            unfreeze_last_n_blocks=model_cfg["unfreeze_last_n_blocks"],
             use_lora=model_cfg["use_lora"],
             lora_rank=model_cfg["lora_rank"],
+            lora_last_n_blocks=model_cfg["lora_last_n_blocks"],
         )
 
     def train(self, mode: bool = True) -> "OvenMultiTaskModel":
@@ -189,7 +199,7 @@ class OvenMultiTaskModel(nn.Module):
         """
         返回各头 logits：is_oven / food [B]，container / accessory [B, C]，
         rack_raw [B, max_rack+1]（未掩码），rack（给了 rack_count 时按层数掩码，无效类为 -inf），
-        proj [B, proj_dim]（L2 归一化），cls [B, D]（原始 DINOv3 CLS，用于和 Proj 特征对比检索效果）。
+        proj [B, proj_dim]（L2 归一化），cls [B, D]（骨干 CLS，用于和 Proj 特征对比检索效果）。
         """
         cls, patches = self.extract(images)
         out = {name: self.heads[name](cls, patches) for name in POOLED_HEADS}
@@ -206,21 +216,51 @@ class OvenMultiTaskModel(nn.Module):
         return out
 
     # =========================
+    # LoRA
+    # =========================
+    def _lora_modules(self) -> list[LoRA]:
+        return [m for m in self.encoder.modules() if isinstance(m, LoRA)]
+
+    @contextlib.contextmanager
+    def lora_disabled(self) -> Iterator[None]:
+        """临时关掉 LoRA，骨干等价于原始预训练的 DINOv3（用于和原始 DINOv3 特征对比）。"""
+        modules = self._lora_modules()
+        for m in modules:
+            m.enabled = False
+        try:
+            yield
+        finally:
+            for m in modules:
+                m.enabled = True
+
+    def merge_lora(self) -> int:
+        """把 LoRA 增量合并进 qkv 权重并去掉 LoRA 结构（导出用，输出不变），返回合并的 block 数。"""
+        merged = 0
+        for block in self.encoder.blocks:
+            if isinstance(block.attn.qkv, LoRA):
+                block.attn.qkv = block.attn.qkv.merged()
+                merged += 1
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.backbone_trainable = False
+        return merged
+
+    # =========================
     # 参数分组与保存
     # =========================
     def head_parameters(self) -> dict[str, list[nn.Parameter]]:
-        """按头分组的可训练参数，用于记录各头的梯度范数。"""
+        """按头分组的可训练参数（LoRA 单独一组），用于记录各头的梯度范数。"""
         groups = {name: [p for p in head.parameters() if p.requires_grad] for name, head in self.heads.items()}
-        backbone = [p for p in self.encoder.parameters() if p.requires_grad]
-        if backbone:
-            groups["backbone"] = backbone
+        lora = [p for p in self.encoder.parameters() if p.requires_grad]
+        if lora:
+            groups["lora"] = lora
         return groups
 
     def _trainable_names(self) -> set[str]:
         return {name for name, p in self.named_parameters() if p.requires_grad}
 
     def trainable_state_dict(self) -> dict[str, torch.Tensor]:
-        """只保存训练过的权重（各头 + 解冻的 block / LoRA），冻结的骨干由预训练权重重建。"""
+        """只保存训练过的权重（各头 + LoRA），冻结的骨干由预训练权重重建。"""
         trainable = self._trainable_names()
         return {
             k: v.detach().cpu()
@@ -242,7 +282,7 @@ class OvenMultiTaskModel(nn.Module):
         return missing, unexpected
 
     def gallery_fingerprint(self, weight_name: str) -> str:
-        """特征库绑定的版本号：由预训练权重名、Proj Head 和骨干可训练部分的权重决定。"""
+        """特征库绑定的版本号：由预训练权重名、Proj Head 和 LoRA 的权重决定（需在 merge_lora 之前计算）。"""
         digest = hashlib.sha1(str(weight_name).encode("utf-8"))
         for key, tensor in sorted(self.trainable_state_dict().items()):
             if key.startswith(("heads.proj.", "encoder.")):

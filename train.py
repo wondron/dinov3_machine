@@ -2,17 +2,16 @@
 """
 一体机多任务视觉识别模型 · 训练入口（设计文档：docs/oven-multitask-design.md）
 
-阶段 1（基线）：冻结 DINOv3，Is-Oven / Food / Container / Accessory / Rack 各头与 Proj Head 联合训练；
-               Rack Head 不加型号条件，只用真实型号的层数掩码。
-阶段 2      ：训练结束后用 ckpt_best.pt 建特征库（gallery.pt），在验证集上标定 tau、多标签逐类阈值、
-               层位置信度阈值（calibration.json），再用这些阈值评估测试集（test_report.json）。
-阶段 4（可选）：配置 model.unfreeze_last_n_blocks 或 model.use_lora，用 --init 加载阶段 1 的 ckpt_best.pt；
-               特征库和各项阈值会在训练结束时随新权重重建、重新标定。
+阶段 1：DINOv3 预训练权重冻结、LoRA 微调，Is-Oven / Food / Container / Accessory / Rack 各头与 Proj Head 联合训练；
+        Rack Head 不加型号条件，只用真实型号的层数掩码。
+阶段 2：训练结束后用 ckpt_best.pt 建特征库（gallery.pt），在验证集上标定 tau、多标签逐类阈值、
+        层位置信度阈值（calibration.json），再用这些阈值评估测试集（test_report.json / test_predictions.json）。
+        tau 更准确的标定见 script/4-留一型号验证.py（每个型号轮流留出、重训后标定）。
 
 用法：
   python train.py --config configs/default_oven.yaml --device auto
   python train.py --resume output/oven/<run>/ckpt_last.pt
-  python train.py --config <阶段4配置> --init output/oven/<run>/ckpt_best.pt
+  python train.py --config <配置> --init output/oven/<run>/ckpt_best.pt
 """
 from __future__ import annotations
 
@@ -34,14 +33,25 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 from dino_finetune.config import get_dino_paths, load_config, resolve_path, validate_config
-from dino_finetune.data import TARGET_KEYS, OvenDataset, OvenTransforms, build_eval_loader, build_train_loader
+from dino_finetune.data import build_eval_loader, build_train_loader
 from dino_finetune.device import DeviceGallery, DeviceSpec, load_device_profile
+from dino_finetune.engine import (
+    build_galleries,
+    build_model,
+    collect_outputs,
+    exclude_groups,
+    group_names_of,
+    load_checkpoint,
+    make_dataset,
+    select_gallery_indices,
+    to_device,
+)
+from dino_finetune.inference import OvenPostprocessor
 from dino_finetune.labels import LabelSchema, OvenLabel, load_split, summarize_labels
 from dino_finetune.logging import setup_logging
 from dino_finetune.losses import MultiTaskLoss, compute_pos_weight
 from dino_finetune.metrics import calibrate_thresholds, default_calibration, evaluate_outputs, weighted_score
 from dino_finetune.model.oven import OvenMultiTaskModel
-from dino_finetune.utils.ckpt import build_encoder
 from dino_finetune.utils.training_monitor import TrainingMonitor
 
 logger = logging.getLogger("train")
@@ -55,7 +65,7 @@ EPOCH_LOG_KEYS = (
     "rack_acc_pm1",
     "rack_floor_acc",
     "device_top1_proj",
-    "device_top1_raw",
+    "device_top1_cls",
     "rack_acc_e2e",
 )
 
@@ -65,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="配置文件；默认 configs/default_oven.yaml，续训时默认用 checkpoint 里保存的配置")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--resume", default=None, help="续训 checkpoint（ckpt_last.pt），输出沿用其所在目录")
-    parser.add_argument("--init", default=None, help="只加载模型权重（不含优化器状态），用于阶段 4 从阶段 1 的 ckpt_best.pt 开始")
+    parser.add_argument("--init", default=None, help="只加载模型权重（不含优化器状态），从已有 checkpoint 开始新一轮训练")
     parser.add_argument("--output_dir", default=None, help="输出目录，默认 <output.root>/<YYMMDD_HHMMSS>")
     args = parser.parse_args()
     if args.resume and args.init:
@@ -100,11 +110,6 @@ def _next_or_restart(data_iter, data_loader: DataLoader):
             raise RuntimeError("训练 DataLoader 为空，无法开始训练") from exc
 
 
-def to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
-    non_blocking = device.type == "cuda"
-    return {k: v.to(device, non_blocking=non_blocking) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -115,19 +120,6 @@ def _fmt(value: float | None) -> str:
 
 def format_metrics(metrics: Mapping[str, float | None], keys: Sequence[str]) -> str:
     return " ".join(f"{key}={_fmt(metrics.get(key))}" for key in keys)
-
-
-# =========================
-# checkpoint
-# =========================
-def load_checkpoint(path: str | Path) -> tuple[Path, dict[str, Any]]:
-    path = Path(path).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"checkpoint 不存在：{path}")
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    if not isinstance(ckpt, dict) or "model" not in ckpt:
-        raise ValueError(f"checkpoint 格式错误：{path}")
-    return path, ckpt
 
 
 def check_compatible(ckpt: Mapping[str, Any], cfg: Mapping[str, Any], group_names: Sequence[str], *, check_groups: bool) -> None:
@@ -179,32 +171,16 @@ def warn_data_coverage(
             logger.warning("验证集出现训练集没有的%s类别：%s", title, unseen)
 
 
-def select_gallery_indices(labels: Sequence[OvenLabel], max_per_model: int, seed: int) -> list[int]:
-    """每个型号最多取 max_per_model 张训练图作为特征库参考图。"""
-    rng = np.random.default_rng(seed)
-    by_model: dict[str, list[int]] = defaultdict(list)
-    for i, label in enumerate(labels):
-        if label.is_oven:
-            by_model[label.device_model].append(i)
-    selected: list[int] = []
-    for model_name in sorted(by_model):
-        idx = by_model[model_name]
-        if len(idx) > max_per_model:
-            idx = sorted(rng.choice(idx, size=max_per_model, replace=False).tolist())
-        selected.extend(idx)
-    return selected
-
-
 # =========================
-# 训练与评估
+# 训练
 # =========================
 def build_optimizer(model: OvenMultiTaskModel, criterion: nn.Module, tp: Mapping[str, Any]) -> torch.optim.Optimizer:
-    decay, no_decay, backbone = [], [], []
+    decay, no_decay, lora = [], [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if name.startswith("encoder."):
-            backbone.append(param)
+            lora.append(param)
         elif param.ndim <= 1:
             no_decay.append(param)
         else:
@@ -214,7 +190,7 @@ def build_optimizer(model: OvenMultiTaskModel, criterion: nn.Module, tp: Mapping
     groups = [
         {"name": "heads", "params": decay, "lr": tp["lr"], "weight_decay": tp["weight_decay"]},
         {"name": "heads_no_decay", "params": no_decay, "lr": tp["lr"], "weight_decay": 0.0},
-        {"name": "backbone", "params": backbone, "lr": tp["lr_backbone"], "weight_decay": tp["weight_decay"]},
+        {"name": "lora", "params": lora, "lr": tp["lr_lora"], "weight_decay": tp["weight_decay"]},
     ]
     groups = [group for group in groups if group["params"]]
     for group in groups:
@@ -243,7 +219,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, total_steps: int, warmup_s
 
 def clip_head_grads(groups: Mapping[str, Sequence[nn.Parameter]], max_norm: float) -> dict[str, float]:
     """
-    逐头裁剪梯度并返回裁剪前各头的梯度 L2 范数（需在 scaler.unscale_ 之后调用）。
+    逐组裁剪梯度并返回裁剪前各组的梯度 L2 范数（需在 scaler.unscale_ 之后调用）。
     各头参数互不共享，逐头裁剪可以避免某个头的大梯度（如 ArcFace）把其他头的更新一起压小；max_norm <= 0 时只统计不裁剪。
     """
     norms = {}
@@ -256,61 +232,6 @@ def clip_head_grads(groups: Mapping[str, Sequence[nn.Parameter]], max_norm: floa
         else:
             norms[name] = float(torch.stack([p.grad.detach().float().norm() for p in params]).norm())
     return norms
-
-
-@torch.no_grad()
-def collect_outputs(
-    model: OvenMultiTaskModel,
-    loader: DataLoader,
-    device: torch.device,
-    use_amp: bool,
-    criterion: MultiTaskLoss | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """在整个评估集上前向，收集各头输出、特征与标签；给了 criterion 时同时统计平均 loss。"""
-    model.eval()
-    chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
-    loss_sums: dict[str, float] = defaultdict(float)
-    count = 0
-    for batch in loader:
-        batch = to_device(batch, device)
-        with torch.amp.autocast(device.type, enabled=use_amp):
-            out = model(batch["image"], batch["rack_count"], batch["floor_usable"])
-            if criterion is not None:
-                loss, terms = criterion(out, batch)
-        n = int(batch["image"].shape[0])
-        count += n
-        if criterion is not None:
-            loss_sums["loss"] += float(loss) * n
-            for term, value in terms.items():
-                loss_sums[f"loss_{term}"] += float(value) * n
-        for key in ("is_oven", "food", "container", "accessory"):
-            chunks[f"{key}_prob"].append(torch.sigmoid(out[key].float()).cpu())
-        for key, src in (("rack_logits", "rack"), ("rack_raw", "rack_raw"), ("proj", "proj"), ("cls", "cls")):
-            chunks[key].append(out[src].float().cpu())
-        for key in TARGET_KEYS:
-            chunks[key].append(batch[key].cpu())
-    arrays = {key: torch.cat(values).numpy() for key, values in chunks.items()}
-    losses = {key: value / max(count, 1) for key, value in loss_sums.items()}
-    return arrays, losses
-
-
-def build_galleries(
-    arrays: Mapping[str, np.ndarray],
-    labels: Sequence[OvenLabel],
-    profile: Mapping[str, DeviceSpec],
-) -> dict[str, DeviceGallery]:
-    """用参考图的 Proj 特征和原始 DINOv3 CLS 特征各建一个特征库，两者的检索效果都会评估。"""
-    group_of = {name: spec.cavity_group for name, spec in profile.items()}
-    galleries = {"proj": DeviceGallery(group_of), "raw": DeviceGallery(group_of)}
-    rows_by_model: dict[str, list[int]] = defaultdict(list)
-    for row, index in enumerate(arrays["index"]):
-        label = labels[int(index)]
-        if label.is_oven:
-            rows_by_model[label.device_model].append(row)
-    for model_name, rows in sorted(rows_by_model.items()):
-        galleries["proj"].add(model_name, torch.from_numpy(arrays["proj"][rows]))
-        galleries["raw"].add(model_name, torch.from_numpy(arrays["cls"][rows]))
-    return galleries
 
 
 def main() -> None:
@@ -339,7 +260,7 @@ def main() -> None:
     setup_logging(name="train", log_file=str(run_dir / "train.log"), use_shanghai_time=True)
 
     device = pick_device(args.device)
-    tp, ev, inp = cfg["trainparams"], cfg["eval"], cfg["input"]
+    tp, ev = cfg["trainparams"], cfg["eval"]
     use_amp = bool(tp["use_amp"] and device.type == "cuda")
     set_seed(tp["seed"])
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -357,7 +278,7 @@ def main() -> None:
         max_rack=max_rack,
         accessory_classes=schema.accessory_classes,
     )
-    group_names = sorted({spec.cavity_group for spec in profile.values()})
+    group_names = group_names_of(profile)
     logger.info("Device Profile：%d 个型号，%d 个 cavity_group", len(profile), len(group_names))
     write_json(run_dir / "device_profile.json", {name: spec.to_dict() for name, spec in profile.items()})
 
@@ -369,35 +290,26 @@ def main() -> None:
     split_labels: dict[str, list[OvenLabel]] = {}
     label_issues: dict[str, list[dict[str, str]]] = {}
     for key, split in splits.items():
-        split_labels[key], issues = load_split(
-            roots, split, schema, profile, on_error=data_cfg["on_error"], strict=data_cfg["strict"]
-        )
+        labels, issues = load_split(roots, split, schema, profile, on_error=data_cfg["on_error"], strict=data_cfg["strict"])
         label_issues[split] = [asdict(issue) for issue in issues]
-        log_label_summary(split, split_labels[key])
+        if data_cfg["exclude_groups"]:
+            kept = exclude_groups(labels, profile, data_cfg["exclude_groups"])
+            logger.info("%s：排除 cavity_group=%s 的 %d 张图", split, data_cfg["exclude_groups"], len(labels) - len(kept))
+            labels = kept
+        if not labels:
+            raise RuntimeError(f"{split} 划分没有可用样本")
+        split_labels[key] = labels
+        log_label_summary(split, labels)
     write_json(run_dir / "label_issues.json", label_issues)
     warn_data_coverage(split_labels["train"], split_labels["val"], profile)
 
     # =========================
     # 3) 数据集与 DataLoader
     # =========================
-    def make_dataset(labels: Sequence[OvenLabel], is_train: bool) -> OvenDataset:
-        transform = OvenTransforms(
-            inp["img_dim"], inp["mean"], inp["std"], inp["img_interp"], is_train=is_train, aug_cfg=inp["train_aug"]
-        )
-        return OvenDataset(
-            labels,
-            transform,
-            container_classes=schema.container_classes,
-            accessory_classes=schema.accessory_classes,
-            profile=profile,
-            group_names=group_names,
-            max_rack=max_rack,
-        )
-
-    train_ds = make_dataset(split_labels["train"], is_train=True)
-    train_eval_ds = make_dataset(split_labels["train"], is_train=False)  # 建特征库用，不做增强
-    val_ds = make_dataset(split_labels["val"], is_train=False)
-    test_ds = make_dataset(split_labels["test"], is_train=False) if "test" in split_labels else None
+    train_ds = make_dataset(split_labels["train"], cfg, profile, is_train=True)
+    train_eval_ds = make_dataset(split_labels["train"], cfg, profile, is_train=False)  # 建特征库用，不做增强
+    val_ds = make_dataset(split_labels["val"], cfg, profile, is_train=False)
+    test_ds = make_dataset(split_labels["test"], cfg, profile, is_train=False) if "test" in split_labels else None
     logger.info("训练预处理：%s", train_ds.transform.describe())
 
     batch_size = tp["batch_size"]
@@ -429,17 +341,12 @@ def main() -> None:
     # =========================
     # 4) 模型与 loss
     # =========================
-    dino_local_repo, weight_path = get_dino_paths(cfg)
-    encoder = build_encoder(cfg, device, dino_local_repo=dino_local_repo, weight_path=weight_path)
-    model = OvenMultiTaskModel.from_config(
-        encoder,
-        cfg,
-        num_container=len(schema.container_classes),
-        num_accessory=len(schema.accessory_classes),
-    ).to(device)
+    _, weight_path = get_dino_paths(cfg)
+    model = build_model(cfg, device)
+    model_cfg = cfg["model"]
     logger.info(
-        "模型：骨干%s，可训练参数 %.2fM",
-        "部分可训练（阶段 4）" if model.backbone_trainable else "冻结",
+        "模型：%s，可训练参数 %.2fM",
+        f"LoRA 微调（{model.lora_blocks} 个 block，rank={model_cfg['lora_rank']}）" if model_cfg["use_lora"] else "骨干完全冻结",
         sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6,
     )
 
@@ -455,7 +362,7 @@ def main() -> None:
         cfg,
         container_pos_weight=pos_weights["container"],
         accessory_pos_weight=pos_weights["accessory"],
-        proj_dim=cfg["model"]["proj_dim"],
+        proj_dim=model_cfg["proj_dim"],
         num_groups=len(group_names),
     ).to(device)
 
@@ -496,14 +403,14 @@ def main() -> None:
         check_compatible(init_ckpt, cfg, group_names, check_groups=False)
         missing, unexpected = model.load_trainable_state_dict(init_ckpt["model"], strict=False)
         logger.info(
-            "从 %s 初始化模型权重：缺失=%d（阶段 4 新放开的骨干参数 / LoRA，保持预训练值或初始值）多余=%d",
+            "从 %s 初始化模型权重：缺失=%d（新加入的 LoRA 等参数，保持初始值）多余=%d",
             init_path, len(missing), len(unexpected),
         )
         del init_ckpt
 
     logger.info("========== 训练参数配置 ==========")
     logger.info("epochs=%d batch_size=%d steps_per_epoch=%d total_steps=%d", tp["epochs"], batch_size, steps_per_epoch, total_steps)
-    logger.info("lr=%.3g lr_backbone=%.3g weight_decay=%.3g min_lr=%.3g warmup_steps=%d", tp["lr"], tp["lr_backbone"], tp["weight_decay"], tp["min_lr"], tp["warmup_steps"])
+    logger.info("lr=%.3g lr_lora=%.3g weight_decay=%.3g min_lr=%.3g warmup_steps=%d", tp["lr"], tp["lr_lora"], tp["weight_decay"], tp["min_lr"], tp["warmup_steps"])
     logger.info("use_amp=%s grad_clip=%.3f 采样=%s", use_amp, tp["grad_clip"], cfg["sampler"]["type"])
     logger.info("loss 权重=%s metric=%s multilabel=%s rack_smoothing=%.3f", loss_cfg["weights"], loss_cfg["metric"], loss_cfg["multilabel"], loss_cfg["rack_smoothing"])
     logger.info("best 综合分权重=%s", ev["score_weights"])
@@ -524,6 +431,8 @@ def main() -> None:
 
     if start_epoch >= tp["epochs"]:
         logger.info("checkpoint 已完成配置中的全部 %d 轮训练，直接进入阶段 2", tp["epochs"])
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for epoch in range(start_epoch, tp["epochs"]):
         model.train()
@@ -606,9 +515,10 @@ def main() -> None:
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         monitor.update(epoch, epoch_metrics)
+        memory = f" 显存峰值={torch.cuda.max_memory_allocated(device) / 2**30:.1f}G" if device.type == "cuda" else ""
         logger.info(
-            "轮次=%d 完成：train_loss=%.4f val_loss=%.4f | %s | score=%.4f",
-            epoch + 1, train_metrics["train_loss"], val_losses["loss"], format_metrics(val_flat, EPOCH_LOG_KEYS), score,
+            "轮次=%d 完成：train_loss=%.4f val_loss=%.4f | %s | score=%.4f%s",
+            epoch + 1, train_metrics["train_loss"], val_losses["loss"], format_metrics(val_flat, EPOCH_LOG_KEYS), score, memory,
         )
 
         # 综合分更高即为最佳；验证集小、指标饱和时综合分常常持平，此时取验证 loss 更低的
@@ -650,6 +560,9 @@ def main() -> None:
     # =========================
     # 8) 阶段 2：建特征库、标定阈值、评估测试集
     # =========================
+    if not ev["run_stage2"]:
+        logger.info("eval.run_stage2=false，跳过阶段 2。输出目录：%s", run_dir)
+        return
     if not best_path.is_file():
         logger.warning("没有 ckpt_best.pt，跳过阶段 2")
         return
@@ -670,7 +583,7 @@ def main() -> None:
             "meta": {
                 **version,
                 "weight": Path(weight_path).name,
-                "img_dim": inp["img_dim"],
+                "img_dim": cfg["input"]["img_dim"],
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "num_refs": dict(Counter(galleries["proj"].labels)) if galleries else {},
             },
@@ -711,6 +624,20 @@ def main() -> None:
         )
         write_json(run_dir / "test_report.json", {**version, "loss": test_losses, **test_report})
         logger.info("测试集：loss=%.4f %s", test_losses["loss"], format_metrics(test_flat, EPOCH_LOG_KEYS))
+
+        # 按设计文档第 3 节的完整推理流程给出测试集逐张预测，附上标注便于对照
+        post = OvenPostprocessor(
+            calibration=calibration,
+            profile=profile,
+            container_classes=container_classes,
+            accessory_classes=accessory_classes,
+            galleries=galleries,
+        )
+        predictions = []
+        for index, result in zip(test_arrays["index"], post(test_arrays)):
+            label = test_ds.labels[int(index)]
+            predictions.append({"image": label.image_path, **result, "label": asdict(label)})
+        write_json(run_dir / "test_predictions.json", predictions)
     logger.info("全部完成，输出目录：%s", run_dir)
 
 

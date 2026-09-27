@@ -16,11 +16,11 @@ model:
   head_dropout: 0.1
   proj_hidden_dim: 512                 # Proj Head：1024 → 512 → 256，输出 L2 归一化
   proj_dim: 256
-  # 阶段 4（可选）：效果不够时再放开骨干，并用 --init 加载阶段 1 的 ckpt_best.pt
-  # 骨干一旦变动，特征库和各项阈值会在训练结束时自动重建、重新标定
-  unfreeze_last_n_blocks: 0
-  use_lora: false
+  # 骨干微调方式：预训练权重冻结，只在 attention 的 Q、V 上训练 LoRA 低秩增量
+  # 骨干变动后特征库和各项阈值必须重建，训练结束时会自动完成
+  use_lora: true                       # false：骨干完全冻结，只训练各任务头
   lora_rank: 8
+  lora_last_n_blocks: 0                # 只在最后 N 个 block 注入 LoRA，0 = 全部 24 个；调小可省显存和时间
 
 # =========================
 # 类别表：顺序就是多标签向量的编码顺序，训练后不要改动
@@ -44,6 +44,7 @@ data:
   test_split: test                     # 留空则不做测试集评估
   on_error: raise                      # 标注硬错误（类别不在类别表、层位越界、型号不在配置表、图片缺失等）：raise 报错 / skip 跳过该样本
   strict: false                        # true 时规范类警告（如有物品但层位为空）也按硬错误处理
+  exclude_groups: []                   # 排除这些 cavity_group 的一体机样本（留一型号验证时由脚本自动设置）
 
 input:
   img_dim: [288, 512]                  # (H, W)，必须能被 16 整除；原图 720x1280，保持 16:9
@@ -100,7 +101,7 @@ trainparams:
   num_workers: 4
   num_workers_eval: 2
   lr: 3.0e-4                           # 各任务头
-  lr_backbone: 1.0e-5                  # 解冻的 block / LoRA
+  lr_lora: 1.0e-4                      # LoRA
   weight_decay: 0.05
   min_lr: 1.0e-6
   warmup_steps: 50
@@ -114,9 +115,9 @@ trainparams:
 # =========================
 eval:
   gallery_max_per_model: 200           # 每个型号最多从训练集取多少张参考图建特征库
-  gallery_feature: proj                # 型号检索用的特征：proj（Proj Head）/ raw（DINOv3 CLS），两种都会评估
+  gallery_feature: proj                # 型号检索用的特征：proj（Proj Head）/ cls（骨干 CLS），两种都会评估；留一型号验证会按结果改成更好的一种
   knn_k: 10
-  tau: 0.5                             # 未知型号阈值默认值；特征库有 2 个以上 cavity_group 时由阶段 2 标定覆盖
+  tau: 0.5                             # 未知型号阈值默认值；特征库有 2 个以上 cavity_group 时由阶段 2 近似标定，留一型号验证再精确标定
   default_threshold: 0.5               # 多标签 / 二分类阈值默认值
   safety_recall_target: 0.95           # 安全相关容器类别的召回率目标
   rack_target_precision: 0.95          # 层位置信度阈值：高于阈值的预测要达到的准确率
@@ -128,6 +129,15 @@ eval:
     is_oven_acc: 0.5
     food_acc: 0.5
   run_test: true                       # 训练结束后用标定好的阈值评估测试集
+  run_stage2: true                     # 训练结束后建特征库、标定阈值（留一验证的各折训练会关掉）
+
+# =========================
+# 留一型号验证（script/4-留一型号验证.py，设计文档第 9 节）
+# =========================
+loo:
+  epochs: 0                            # 每折训练轮数，0 = 与 trainparams.epochs 相同
+  holdout_frac: 0.3                    # 被留出的型号在验证集里没有图片时，从它的训练图里留出这个比例当查询图
+  min_group_images: 4                  # 训练图少于这个数的 cavity_group 不做留一
 
 output:
   root: output/oven                    # 每次训练输出到 <root>/<YYMMDD_HHMMSS>/
