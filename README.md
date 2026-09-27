@@ -1,0 +1,2 @@
+# dinov3_machine
+基于Dinov3的embedding模型搭建
