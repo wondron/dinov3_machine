@@ -324,6 +324,7 @@ def main() -> None:
         num_workers=tp["num_workers"],
         seed=tp["seed"],
         pin_memory=pin_memory,
+        require_supcon=cfg["loss"]["metric"] == "supcon" and cfg["loss"]["weights"]["proj"] > 0,
     )
     val_loader = build_eval_loader(val_ds, persistent=True, **eval_kwargs)
     gallery_indices = select_gallery_indices(train_eval_ds.labels, ev["gallery_max_per_model"], tp["seed"])

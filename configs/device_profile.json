@@ -3,5 +3,5 @@
   "C9277A":    {"rack_count": 5, "floor_usable": true, "cavity_group": "G5A", "accessories": ["烤盘", "小炸篮"]},
   "CQ09-i9":   {"rack_count": 3, "floor_usable": true, "cavity_group": "G3A", "accessories": null},
   "C87-i7Pro": {"rack_count": 5, "floor_usable": true, "cavity_group": "G5B", "accessories": ["微波专用烤架", "小炸篮", "烤盘"]},
-  "DB677":     {"rack_count": 2, "floor_usable": true, "cavity_group": "G2A", "accessories": null}
+  "DB677":     {"rack_count": 2, "floor_usable": false, "cavity_group": "G2A", "accessories": null}
 }

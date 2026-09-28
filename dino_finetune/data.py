@@ -269,6 +269,7 @@ class PKBatchSampler(Sampler[list[int]]):
         non_oven_ratio: float,
         num_batches: int,
         seed: int = 0,
+        require_supcon: bool = False,
     ) -> None:
         group_ids = np.asarray(group_ids)
         self.pools = {int(g): np.flatnonzero(group_ids == g) for g in np.unique(group_ids[group_ids >= 0])}
@@ -276,16 +277,47 @@ class PKBatchSampler(Sampler[list[int]]):
         if not self.pools and len(self.non_oven) == 0:
             raise ValueError("训练集为空，无法采样")
 
+        self.require_supcon = bool(require_supcon)
+        if self.require_supcon:
+            if batch_size < 4:
+                raise ValueError(
+                    "SupCon + PK 采样需要 trainparams.batch_size >= 4，"
+                    "以保证至少 2 个 cavity_group、每组至少 2 张一体机图片；"
+                    "请增大训练 batch_size，或将 loss.weights.proj 设为 0。"
+                )
+            if p_groups < 2:
+                raise ValueError("SupCon + PK 采样需要 sampler.p_groups >= 2，请增大 p_groups。")
+            if len(self.pools) < 2:
+                raise ValueError(
+                    f"SupCon + PK 采样需要训练集中至少 2 个 cavity_group，实际为 {len(self.pools)}；"
+                    "请补充不同组的一体机样本，或将 loss.weights.proj 设为 0。"
+                )
+
         if not self.pools:
             n_non_oven = batch_size
         elif len(self.non_oven) == 0:
             n_non_oven = 0
         else:
-            # 每个 batch 至少保留 2 张一体机图片，保证型号对比学习有样本
-            n_non_oven = min(int(round(batch_size * non_oven_ratio)), max(batch_size - 2, 0))
+            requested_non_oven = int(round(batch_size * non_oven_ratio))
+            min_oven = 4 if self.require_supcon else 2
+            n_non_oven = min(requested_non_oven, max(batch_size - min_oven, 0))
+            if self.require_supcon and n_non_oven != requested_non_oven:
+                logger.warning(
+                    "SupCon + PK：非一体机配额从 %d 调整为 %d（batch_size=%d），"
+                    "为至少 2 个组各保留 2 张一体机图片。",
+                    requested_non_oven, n_non_oven, batch_size,
+                )
         self.n_non_oven = n_non_oven
         self.n_oven = batch_size - n_non_oven
         self.p = min(int(p_groups), len(self.pools))
+        if self.require_supcon:
+            self.p = min(self.p, self.n_oven // 2)
+            if self.p != int(p_groups):
+                logger.warning(
+                    "SupCon + PK：P 从 %d 调整为 %d（可用组数=%d，一体机配额=%d），"
+                    "保证每组至少 2 张一体机图片。",
+                    p_groups, self.p, len(self.pools), self.n_oven,
+                )
         self.num_batches = int(num_batches)
         self.seed = int(seed)
         self.epoch = 0
@@ -330,6 +362,7 @@ def build_train_loader(
     num_workers: int,
     seed: int,
     pin_memory: bool,
+    require_supcon: bool = False,
 ) -> DataLoader:
     common = dict(num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0)
     if sampler_cfg["type"] == "pk":
@@ -340,6 +373,7 @@ def build_train_loader(
             non_oven_ratio=sampler_cfg["non_oven_ratio"],
             num_batches=steps_per_epoch,
             seed=seed,
+            require_supcon=require_supcon,
         )
         logger.info(batch_sampler.describe())
         return DataLoader(dataset, batch_sampler=batch_sampler, **common)

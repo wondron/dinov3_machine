@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument("--device_model", default=None, help="已知设备型号时直接使用，跳过特征库检索")
     parser.add_argument("--pending_dir", default=None, help="把判为未知型号的图片复制到这个目录（待补库池）")
     parser.add_argument("--scores", action="store_true", help="结果里附上各头原始概率")
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=1, choices=(1,), help="固定为 1，目录内图片逐张推理")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     args = parser.parse_args()
     setup_logging(name="infer", use_shanghai_time=True)

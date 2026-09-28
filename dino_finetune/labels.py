@@ -97,9 +97,15 @@ def _parse_names(
     if key not in ann:
         report("warning", "missing_field", f"缺少 {key}，按未标注处理")
         return None
+    
     value = ann[key]
     if value is None:
         return None
+
+    if '遮挡' in value:
+        report("warning", "遮挡", f"{key} 中包含“遮挡”，按照“无”处理")
+        return None
+    
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):

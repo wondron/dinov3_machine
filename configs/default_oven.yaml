@@ -26,10 +26,10 @@ model:
 # 类别表：顺序就是多标签向量的编码顺序，训练后不要改动
 # =========================
 labels:
-  container: [玻璃容器, 塑料容器, 陶瓷容器, 金属容器, 泡沫容器, 木竹容器, 纸质容器, 油纸, 保鲜膜, 铝箔]
-  accessory: [玻璃蒸烤盘, 脆烤盘, 微波专用烤架, 烤架, 炸烤网架, 烤盘, 有孔蒸盘, 无孔蒸盘, 小炸篮]
-  safety_container: [金属容器, 铝箔, 泡沫容器]   # 按召回率目标定阈值
-  none_tokens: ["无"]                  # 列表里出现视为空列表；device_model / rack_level / food_name 出现视为 null / 无
+  container: [玻璃容器, 塑料容器, 陶瓷容器, 泡沫容器, 金属容器, 木质/竹制容器, 纸质容器, 油纸, 珐琅锅, 保鲜膜, 铝箔纸]
+  accessory: [玻璃蒸烤盘, 脆烤盘, 微波专用烤架, 烤架, 炸烤网架, 烤盘, 有孔蒸盘, 无孔蒸盘, 小炸篮, 遮挡]
+  safety_container: [金属容器, 铝箔纸, 泡沫容器]          # 按召回率目标定阈值
+  none_tokens: ["无"]                                 # 列表里出现视为空列表；device_model / rack_level / food_name 出现视为 null / 无
 
 # 设备配置表：rack_count、floor_usable、cavity_group、支持的附件
 device_profile: configs/device_profile.json
@@ -38,7 +38,7 @@ device_profile: configs/device_profile.json
 # 数据：<root>/<split>/*.json，每个 JSON 旁边放同名图片
 # =========================
 data:
-  root: data/model/0904                # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
+  root: data/0904                # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
   train_split: train
   val_split: val
   test_split: test                     # 留空则不做测试集评估
@@ -50,8 +50,7 @@ input:
   img_dim: [288, 512]                  # (H, W)，必须能被 16 整除；原图 720x1280，保持 16:9
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
-  img_interp: linear
-  # 一体机场景的增强约束：不上下翻转、不做旋转、不大幅竖直平移、裁剪不能切掉底板和导轨
+  img_interp: linear                   # 一体机场景的增强约束：不上下翻转、不做旋转、不大幅竖直平移、裁剪不能切掉底板和导轨
   train_aug:
     enabled: true
     max_crop_frac: 0.05                # 四条边各自随机裁掉 0～5%
@@ -67,8 +66,8 @@ input:
 # =========================
 sampler:
   type: pk                             # pk：每个 batch 取 P 个型号 × K 张，各型号（cavity_group）等概率；random：普通打乱
-  p_groups: 4                          # 型号数不足 P 时取全部
-  non_oven_ratio: 0.25                 # 每个 batch 中非一体机图片的占比；数据里没有非一体机图片时自动为 0
+  p_groups: 4                          # SupCon 启用时实际 P 会按型号数和 batch 容量下调，保证 P>=2、每组 K>=2
+  non_oven_ratio: 0.25                 # 非一体机目标占比；SupCon 至少保留 4 张一体机，不足时降低该占比；无非一体机时为 0
 
 # =========================
 # Loss
@@ -96,7 +95,7 @@ loss:
 # =========================
 trainparams:
   epochs: 30
-  batch_size: 16
+  batch_size: 16                       # PK + SupCon 且 proj 权重>0 时至少为 4（推理固定 batch=1 不受影响）
   steps_per_epoch: 0                   # 0：按 ceil(训练样本数 / batch_size)
   num_workers: 4
   num_workers_eval: 2

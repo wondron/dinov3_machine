@@ -49,7 +49,9 @@ def strip_prefix(sd: dict[str, Any], prefix: str) -> dict[str, Any]:
 
 
 def auto_align_and_load(model: nn.Module, ckpt_sd: dict[str, Any]) -> tuple[list[str], list[str]]:
-    model_keys = set(model.state_dict().keys())
+    """Load a complete backbone, validating all state before copying any tensors."""
+    model_sd = model.state_dict()
+    model_keys = set(model_sd)
     candidates = [
         "",
         "module.",
@@ -82,26 +84,50 @@ def auto_align_and_load(model: nn.Module, ckpt_sd: dict[str, Any]) -> tuple[list
             best_sd = sd_try
 
     if best_sd is None or best_match <= 0:
-        msd = model.state_dict()
-        filtered = {
-            k: v for k, v in ckpt_sd.items()
-            if k in msd and hasattr(v, "shape") and v.shape == msd[k].shape
-        }
-        if not filtered:
-            raise RuntimeError("无法从 checkpoint 中匹配到任何模型参数")
-        best_sd = filtered
-        best_prefix = "(shape-filter)"
-        best_match = len(filtered)
+        raise RuntimeError("拒绝加载骨干 checkpoint：无法匹配到任何模型参数，模型未修改")
 
-    missing, unexpected = model.load_state_dict(best_sd, strict=False)
+    # load_state_dict can copy valid tensors before reporting other errors.
+    # Validate parameters AND persistent buffers first, so an invalid checkpoint
+    # never leaves a partially loaded (and subsequently frozen) backbone.
+    missing = sorted(model_keys - set(best_sd))
+    unexpected = sorted(set(best_sd) - model_keys)
+    invalid = []
+    for key, expected in model_sd.items():
+        if key not in best_sd:
+            continue
+        value = best_sd[key]
+        if not isinstance(value, torch.Tensor):
+            invalid.append(f"{key}: 期望 Tensor，实际为 {type(value).__name__}")
+        elif value.shape != expected.shape:
+            invalid.append(f"{key}: 形状不匹配，期望 {tuple(expected.shape)}，实际为 {tuple(value.shape)}")
+        elif value.layout != expected.layout:
+            invalid.append(f"{key}: 布局不匹配，期望 {expected.layout}，实际为 {value.layout}")
+        elif value.is_meta:
+            invalid.append(f"{key}: meta Tensor 没有可加载的权重数据")
+
+    if missing or invalid:
+        details = []
+        if missing:
+            details.append(f"缺失参数或持久缓冲区 {len(missing)} 项（前 20 项）：{missing[:20]}")
+        if invalid:
+            details.append(f"无效权重 {len(invalid)} 项（前 20 项）：{invalid[:20]}")
+        raise RuntimeError(
+            f"拒绝加载骨干 checkpoint（前缀={best_prefix!r}，匹配={best_match}/{len(model_keys)}）："
+            + "；".join(details)
+            + "。骨干权重必须完整且兼容，模型未修改"
+        )
+
+    # Full training checkpoints may also contain task heads. Only backbone keys
+    # are loaded, but their coverage is strict. Floating-point dtype conversion
+    # remains supported, e.g. BF16 pretrained weights into an FP32 encoder.
+    state_to_load = {key: best_sd[key] for key in model_sd}
+    model.load_state_dict(state_to_load, strict=True)
     logger.info(
         "加载 ckpt 完成：前缀=%s, 匹配=%d, 缺失=%d, 多余=%d",
         best_prefix, best_match, len(missing), len(unexpected)
     )
-    if len(missing) > 0:
-        logger.warning("缺失参数（前 20 个）：%s", missing[:20])
     if len(unexpected) > 0:
-        logger.warning("多余参数（前 20 个）：%s", unexpected[:20])
+        logger.warning("忽略非骨干参数（前 20 个）：%s", unexpected[:20])
     return missing, unexpected
 
 

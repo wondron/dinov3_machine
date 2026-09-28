@@ -64,8 +64,17 @@ class SupConLoss(nn.Module):
         super().__init__()
         self.temperature = float(temperature)
 
+    @staticmethod
+    def valid_anchors(labels: torch.Tensor) -> torch.Tensor:
+        """有效 anchor 必须有同组正样本，且 batch 内还存在其他组作为负样本。"""
+        _, inverse, counts = torch.unique(labels, return_inverse=True, return_counts=True)
+        if counts.numel() < 2:
+            return torch.zeros_like(labels, dtype=torch.bool)
+        return counts[inverse] > 1
+
     def forward(self, feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if feats.shape[0] < 2 or torch.unique(labels).numel() < 2:
+        anchors = self.valid_anchors(labels)
+        if not anchors.any():
             return torch.zeros((), device=feats.device)
         with torch.autocast(device_type=feats.device.type, enabled=False):
             feats = F.normalize(feats.float(), dim=-1)
@@ -74,9 +83,6 @@ class SupConLoss(nn.Module):
             log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
             pos = (labels[:, None] == labels[None, :]) & ~self_mask
             pos_count = pos.sum(1)
-            anchors = pos_count > 0
-            if not anchors.any():
-                return torch.zeros((), device=feats.device)
             mean_log_prob_pos = log_prob.masked_fill(~pos, 0.0).sum(1)[anchors] / pos_count[anchors]
             return -mean_log_prob_pos.mean()
 
@@ -174,6 +180,27 @@ class MultiTaskLoss(nn.Module):
         if not valid.any():
             return torch.zeros((), device=valid.device)
         return rack_loss(out["rack"][valid], batch["rack_level"][valid], batch["rack_count"][valid], self.rack_smoothing)
+
+    def effective_counts(self, batch: Mapping[str, torch.Tensor]) -> dict[str, int]:
+        """各项平均 loss 的分母，用于跨 batch 汇总验证 / 测试 loss。
+
+        多标签头按有标注的行计数（每行类别数固定）；SupCon 只计有正负样本的
+        anchor，ArcFace 计所有一体机样本。整批没有该任务的有效样本时分母为 0。
+        """
+        is_oven = batch["is_oven"] > 0.5
+        proj_count = (
+            int(self.metric_loss.valid_anchors(batch["group_id"][is_oven]).sum())
+            if isinstance(self.metric_loss, SupConLoss)
+            else int(is_oven.sum())
+        )
+        return {
+            "is_oven": int(is_oven.numel()),
+            "proj": proj_count,
+            "food": int(batch["food_known"].sum()),
+            "container": int(batch["container_known"].sum()),
+            "accessory": int(batch["accessory_known"].sum()),
+            "rack": int((is_oven & batch["rack_known"]).sum()),
+        }
 
     def forward(
         self,

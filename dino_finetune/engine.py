@@ -116,31 +116,36 @@ def collect_outputs(
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """
     在整个数据集上前向，收集推理输出（各头概率、未掩码层位 logits、proj / cls 特征）、
-    按真实型号掩码的层位 logits（rack_logits）和标签；给了 criterion 时同时统计平均 loss。
+    按真实型号掩码的层位 logits（rack_logits）和标签；给了 criterion 时按各任务的
+    有效样本数汇总平均 loss，再按任务权重计算总 loss。SupCon 按有效 anchor 汇总，
+    其正负样本仍来自各自的 batch，因此该项本身仍受 batch 组成影响。
     """
     model.eval()
     chunks: dict[str, list[torch.Tensor]] = defaultdict(list)
     loss_sums: dict[str, float] = defaultdict(float)
-    count = 0
+    loss_counts: dict[str, int] = defaultdict(int)
     for batch in loader:
         batch = to_device(batch, device)
         with torch.amp.autocast(device.type, enabled=use_amp):
             out = model(batch["image"], batch["rack_count"], batch["floor_usable"])
             if criterion is not None:
-                loss, terms = criterion(out, batch)
-        n = int(batch["image"].shape[0])
-        count += n
+                _, terms = criterion(out, batch)
         if criterion is not None:
-            loss_sums["loss"] += float(loss) * n
+            effective_counts = criterion.effective_counts(batch)
             for term, value in terms.items():
-                loss_sums[f"loss_{term}"] += float(value) * n
+                count = effective_counts[term]
+                loss_counts[term] += count
+                if count:
+                    loss_sums[term] += float(value) * count
         for key, value in inference_outputs(out).items():
             chunks[key].append(value.cpu())
         chunks["rack_logits"].append(out["rack"].float().cpu())
         for key in TARGET_KEYS:
             chunks[key].append(batch[key].cpu())
     arrays = {key: torch.cat(values).numpy() for key, values in chunks.items()}
-    losses = {key: value / max(count, 1) for key, value in loss_sums.items()}
+    losses = {f"loss_{term}": loss_sums[term] / max(count, 1) for term, count in loss_counts.items()}
+    if criterion is not None and loss_counts:
+        losses["loss"] = sum(criterion.weights[term] * losses[f"loss_{term}"] for term in loss_counts)
     return arrays, losses
 
 
