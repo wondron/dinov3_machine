@@ -255,7 +255,12 @@ def main() -> None:
         if args.output_dir:
             run_dir = Path(args.output_dir).expanduser().resolve()
         else:
-            run_dir = resolve_path(cfg["output"]["root"]) / datetime.now().strftime("%y%m%d_%H%M%S")
+            run_dir = resolve_path(cfg["output"]["root"]) / datetime.now().strftime("%y%m%d")
+
+    if run_dir.exists():
+        import shutil
+        shutil.rmtree(run_dir)
+
     run_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(name="train", log_file=str(run_dir / "train.log"), use_shanghai_time=True)
 
