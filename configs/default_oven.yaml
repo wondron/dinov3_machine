@@ -1,7 +1,6 @@
 # 一体机多任务视觉识别 · 默认训练配置
 # 设计文档：docs/oven-multitask-design.md（v2）
 # 相对路径均以项目根目录为基准
-
 # =========================
 # 骨干与各任务头
 # =========================
@@ -38,7 +37,7 @@ device_profile: configs/device_profile.json
 # 数据：<root>/<split>/*.json，每个 JSON 旁边放同名图片
 # =========================
 data:
-  root: data/0904                # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
+  root: data/0904                      # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
   train_split: train
   val_split: val
   test_split: test                     # 留空则不做测试集评估
