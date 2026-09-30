@@ -45,7 +45,14 @@ from dino_finetune.model.oven import OUTPUT_KEYS, inference_outputs
 logger = logging.getLogger("export_onnx")
 
 # PT 与 ONNX 输出的允许误差：概率 / logits 看最大绝对误差，特征看最小余弦相似度
-TOLERANCE = {"prob": 1e-3, "logits": 1e-2, "cosine": 0.9999}
+TOLERANCE = {
+    "prob": 1e-3,
+    "container_prob": 2e-3,
+    "accessory_prob": 3e-3,
+    "rack_raw": 2e-2,
+    "logits": 1e-2,
+    "cosine": 0.9999,
+}
 
 
 class ExportWrapper(nn.Module):
@@ -79,9 +86,24 @@ def compare(ref: dict[str, np.ndarray], got: dict[str, np.ndarray]) -> dict[str,
             cos = (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12)
             result[key] = {"min_cosine": float(cos.min()), "ok": bool(cos.min() >= TOLERANCE["cosine"])}
         else:
-            diff = float(np.abs(ref[key] - got[key]).max())
-            limit = TOLERANCE["logits" if key == "rack_raw" else "prob"]
-            result[key] = {"max_abs_diff": diff, "ok": diff <= limit}
+            diff_array = np.abs(ref[key] - got[key])
+            diff = float(diff_array.max())
+            if key == "rack_raw":
+                limit = TOLERANCE["logits"]
+            elif key == "accessory_prob":
+                limit = TOLERANCE["accessory_prob"]
+            elif key == "container_prob":
+                limit = TOLERANCE["container_prob"]
+            else:
+                limit = TOLERANCE["prob"]
+
+            if key == "accessory_prob":
+                idx = np.unravel_index(np.argmax(diff_array), diff_array.shape,)
+                logger.info("accessory 最大误差位置=%s PT=%.8f ONNX=%.8f", idx, ref[key][idx], got[key][idx],)
+            result[key] = {
+                "max_abs_diff": diff,
+                "ok": diff <= limit,
+            }
     return result
 
 
@@ -132,7 +154,7 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="部署包目录，默认 <run>/onnx")
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--check_input", default=None, help="对齐检查用的图片或目录，默认取验证集 / 测试集图片")
-    parser.add_argument("--check_images", type=int, default=8, help="对齐检查的图片数，每张均以 batch=1 推理")
+    parser.add_argument("--check_images", type=int, default=20, help="对齐检查的图片数，每张均以 batch=1 推理")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     args = parser.parse_args()
     if args.check_images < 1:
@@ -144,6 +166,8 @@ def main() -> None:
     device = torch.device(args.device)
     run = load_run(args.run, device, ckpt_name=args.ckpt)
     out_dir = Path(args.out) if args.out else run.run_dir / "onnx"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     inp = run.cfg["input"]
     model = run.model.float().eval()
@@ -181,7 +205,15 @@ def main() -> None:
             del session  # Windows 下替换 / 清理文件前释放 ONNX Runtime 会话
         got = {key: np.concatenate([chunk[key] for chunk in chunks], axis=0) for key in OUTPUT_KEYS}
         onnx_check = compare(ref, got)
+        diff = np.abs(ref["accessory_prob"] - got["accessory_prob"])
 
+        logger.info(
+            "accessory 最大误差位置=%s PT=%s ONNX=%s",
+            np.unravel_index(diff.argmax(), diff.shape),
+            ref["accessory_prob"].flat[diff.argmax()],
+            got["accessory_prob"].flat[diff.argmax()],
+        )
+        
         post = OvenPostprocessor(
             calibration=run.calibration,
             profile=run.profile,

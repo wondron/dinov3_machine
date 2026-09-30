@@ -28,10 +28,10 @@ from dino_finetune.logging import setup_logging
 # 配置：运行前按实际路径修改
 # =========================
 RUN_DIR = "output/oven/260929"       # train.py 的完整输出目录，需要完成阶段 2
-INPUT_DIR = "data/0904/test"         # 图片目录，递归包含子目录
+INPUT_DIR = "/data/wangzhuo/66-newdata/00-dataset/03-多属性/02-traindata/01-dinov3/20260929/test/3afcac815e2fc464fe1640f20211d91f.jpg"         # 图片目录，递归包含子目录
 OUTPUT_JSON = None                  # None：保存到 <RUN_DIR>/predictions/<输入目录名>.json
 CKPT_NAME = "ckpt_best.pt"           # 权重必须与特征库、阈值的版本一致
-DEVICE = "auto"                     # auto / cpu / cuda
+DEVICE = "cuda"                     # auto / cpu / cuda
 DEVICE_MODEL = None                 # None：自动检索；已知型号可填 "C87-i7Pro"
 WITH_SCORES = False                 # 是否附上各头原始概率
 PENDING_DIR = None                  # 可选：把判为未知型号的图片复制到该目录
@@ -47,10 +47,15 @@ def project_path(value: str | Path) -> Path:
 def main() -> None:
     setup_logging(name="infer_dir", use_shanghai_time=True)
 
-    input_dir = project_path(INPUT_DIR)
-    if not input_dir.is_dir():
-        raise NotADirectoryError(f"INPUT_DIR 必须是存在的图片目录：{input_dir}")
-    paths = list_images(input_dir)
+    input_path = project_path(INPUT_DIR)
+
+    if input_path.is_file():
+        paths = [input_path]
+        input_dir = input_path.parent
+    elif input_path.is_dir():
+        paths = list_images(input_path)
+    else:
+        raise FileNotFoundError(f"路径不存在：{input_path}")
 
     if DEVICE not in ("auto", "cpu", "cuda"):
         raise ValueError(f"DEVICE 必须是 auto / cpu / cuda，实际为 {DEVICE!r}")

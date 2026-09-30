@@ -18,9 +18,8 @@ import argparse
 import json
 import logging
 from pathlib import Path
-
 import numpy as np
-
+import onnxruntime as ort
 from dino_finetune.data import OvenTransforms
 from dino_finetune.device import load_device_profile
 from dino_finetune.inference import (
@@ -35,11 +34,10 @@ from dino_finetune.logging import setup_logging
 
 logger = logging.getLogger("infer_onnx")
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="一体机多任务模型 ONNX 推理")
-    parser.add_argument("--onnx_dir", required=True, help="6-export_onnx.py 生成的部署包目录")
-    parser.add_argument("--input", required=True, help="单张图片或图片目录（递归查找）")
+    parser.add_argument("--onnx_dir", default='/data/wangzhuo/01-code/02-project/dinov3_machine/output/oven/260929/onnx', help="6-export_onnx.py 生成的部署包目录")
+    parser.add_argument("--input", default='/data/wangzhuo/66-newdata/00-dataset/03-多属性/02-traindata/01-dinov3/20260929/test/3afcac815e2fc464fe1640f20211d91f.jpg', help="单张图片或图片目录（递归查找）")
     parser.add_argument("--out", default=None, help="结果 JSON，默认 <onnx_dir>/predictions/<输入名>.json")
     parser.add_argument("--device_model", default=None, help="已知设备型号时直接使用，跳过特征库检索")
     parser.add_argument("--pending_dir", default=None, help="把判为未知型号的图片复制到这个目录（待补库池）")
@@ -47,9 +45,12 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=1, choices=(1,), help="固定为 1，目录内图片逐张推理")
     parser.add_argument("--provider", default="auto", choices=("auto", "cpu", "cuda"))
     args = parser.parse_args()
+    
+    
+    
+    
+    
     setup_logging(name="infer_onnx", use_shanghai_time=True)
-
-    import onnxruntime as ort
 
     bundle = Path(args.onnx_dir)
     meta = json.loads((bundle / "meta.json").read_text(encoding="utf-8"))
@@ -58,9 +59,7 @@ def main() -> None:
     versions = {meta["fingerprint"], calibration["fingerprint"], gallery_meta["fingerprint"]}
     if len(versions) != 1:
         raise RuntimeError(f"部署包内的模型 / 阈值 / 特征库版本不一致：{versions}")
-    profile = load_device_profile(
-        bundle / "device_profile.json", max_rack=meta["max_rack"], accessory_classes=meta["accessory_classes"]
-    )
+    profile = load_device_profile( bundle / "device_profile.json", max_rack=meta["max_rack"], accessory_classes=meta["accessory_classes"] )
     post = OvenPostprocessor(
         calibration=calibration,
         profile=profile,
