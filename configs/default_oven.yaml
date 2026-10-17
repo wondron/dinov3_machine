@@ -37,11 +37,11 @@ device_profile: configs/device_profile.json
 # 数据：<root>/<split>/*.json，每个 JSON 旁边放同名图片
 # =========================
 data:
-  root: /data/wangzhuo/66-newdata/00-dataset/03-多属性/02-traindata/01-dinov3/20260929                       # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
+  root: /data/wangzhuo/66-newdata/00-dataset/03-多属性/02-traindata/01-dinov3/20261016      # 也可以写成列表合并多个批次，如 [data/model/0904, data/model/0915]
   train_split: train
   val_split: val
   test_split: test                     # 留空则不做测试集评估
-  on_error: skip                      # 标注硬错误（类别不在类别表、层位越界、型号不在配置表、图片缺失等）：raise 报错 / skip 跳过该样本
+  on_error: skip                       # 标注硬错误（类别不在类别表、层位越界、型号不在配置表、图片缺失等）：raise 报错 / skip 跳过该样本
   strict: false                        # true 时规范类警告（如有物品但层位为空）也按硬错误处理
   exclude_groups: []                   # 排除这些 cavity_group 的一体机样本（留一型号验证时由脚本自动设置）
 
