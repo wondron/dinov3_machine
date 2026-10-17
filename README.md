@@ -5,6 +5,17 @@
 整体方案见 [docs/oven-multitask-design.md](docs/oven-multitask-design.md)，使用方法见 [script/0-使用方法.md](script/0-使用方法.md)。
 
 ## 快速开始
+
+使用标注工具的原始数据时，先整理训练集：
+
+```bash
+python script/01-genTrainData.py --src <原始数据目录> --dst <训练数据根目录>
+```
+
+脚本按设备型号分层划分 train / val / test，输出日期目录和 `split_summary.json`，并打印各划分中的外部设备数量。同日重跑会另建带时间的目录，不删除已有结果。将 `configs/default_oven.yaml` 的 `data.root` 指向本次打印的输出目录。
+
+`device_model="未知"` / `"未知型号"` 表示明确非本司的设备内腔：保留 `is_oven=true`，参与可靠的食物、容器和附件训练，不参与公司型号和层位训练、不进入型号特征库。PK 采样使用独立的 `sampler.unknown_oven_ratio` 配额；`non_oven_ratio` 仍只表示非内腔图片。图片标注中显式出现的 `null` 表示确认没有（食物为 false，容器/附件为空列表）；缺失字段和“遮挡”不监督。层位的 `null` / `["无"]` 不训练，数字 `0` 才是底板层。设备配置表中的 `accessories:null` 仍表示支持列表尚未配置。
+
 ```bash
 pip install -r requirements.txt
 # 需要：third_party/dinov3（DINOv3 源码）和 data/model/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth（预训练权重）
@@ -47,6 +58,6 @@ ONNX 输入固定为 `[1, 3, H, W]`，导出时使用传统 PyTorch ONNX 导出�
 
 ## 与设计文档的对应
 - 已实现：各任务头联合训练、可选 Q/V LoRA（默认开启）、建特征库、标定 tau / 逐类阈值 / 层位置信度阈值，以及 PT 推理、固定 batch=1 的 ONNX 导出和推理。`model.use_lora: false` 可训练冻结骨干基线，再用 `--init` 加载基线并开启 LoRA；`model.lora_last_n_blocks` 控制注入范围。
-- tau 的标定用"把该型号所在 cavity_group 临时移出特征库"近似留一型号验证，Proj Head 不重训；特征库里少于 2 个 cavity_group 时无法标定，使用配置默认值。
+- tau 优先用验证集中的库内公司设备和真实外部设备标定；没有外部样本时，用“把该型号所在 cavity_group 临时移出特征库”近似留一型号验证，Proj Head 不重训。两种标定均不可用时，使用配置默认值。
 - `script/4-留一型号验证.py` 实现了逐 cavity_group 留出重训、拒识与入库后识别评估。
 - 尚未实现：阶段 3（原型条件 Rack Head 对比实验）、直接解冻骨干原始权重；不支持 `model.unfreeze_last_n_blocks`。

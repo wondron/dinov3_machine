@@ -87,7 +87,7 @@ def exclude_groups(
 ) -> list[OvenLabel]:
     """去掉属于指定 cavity_group 的一体机样本（留一型号验证时，被留出的型号不参与训练和选模型）。"""
     groups = set(groups)
-    return [lb for lb in labels if not (lb.is_oven and profile[lb.device_model].cavity_group in groups)]
+    return [lb for lb in labels if not (lb.device_known and profile[lb.device_model].cavity_group in groups)]
 
 
 def select_gallery_indices(labels: Sequence[OvenLabel], max_per_model: int, seed: int) -> list[int]:
@@ -95,7 +95,7 @@ def select_gallery_indices(labels: Sequence[OvenLabel], max_per_model: int, seed
     rng = np.random.default_rng(seed)
     by_model: dict[str, list[int]] = defaultdict(list)
     for i, label in enumerate(labels):
-        if label.is_oven:
+        if label.device_known:
             by_model[label.device_model].append(i)
     selected: list[int] = []
     for model_name in sorted(by_model):
@@ -160,7 +160,7 @@ def build_galleries(
     rows_by_model: dict[str, list[int]] = defaultdict(list)
     for row, index in enumerate(arrays["index"]):
         label = labels[int(index)]
-        if label.is_oven:
+        if label.device_known:
             rows_by_model[label.device_model].append(row)
     for model_name, rows in sorted(rows_by_model.items()):
         for name in FEATURES:

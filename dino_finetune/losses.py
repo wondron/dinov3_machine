@@ -132,8 +132,8 @@ def rack_loss(logits: torch.Tensor, target: torch.Tensor, rack_count: torch.Tens
 class MultiTaskLoss(nn.Module):
     """
     设计文档第 5 节的加权多任务 loss：
-      Is-Oven BCE（全部）、Proj SupCon / ArcFace（is_oven=1）、Food BCE（有标注的样本）、
-      Container / Accessory 多标签 BCE（有标注的样本）、层位 CE（is_oven=1 且层位不为 null，掩码用真实型号的层数）。
+      Is-Oven BCE（全部）、Proj SupCon / ArcFace（已知公司型号）、Food BCE（有标注的样本）、
+      Container / Accessory 多标签 BCE（有标注的样本）、层位 CE（已知公司型号且层位有效，掩码用真实型号的层数）。
     返回 (加权总 loss, 各项未加权 loss)。
     """
 
@@ -185,13 +185,14 @@ class MultiTaskLoss(nn.Module):
         """各项平均 loss 的分母，用于跨 batch 汇总验证 / 测试 loss。
 
         多标签头按有标注的行计数（每行类别数固定）；SupCon 只计有正负样本的
-        anchor，ArcFace 计所有一体机样本。整批没有该任务的有效样本时分母为 0。
+        anchor，ArcFace 只计已知公司型号样本。整批没有该任务的有效样本时分母为 0。
         """
         is_oven = batch["is_oven"] > 0.5
+        device_known = is_oven & (batch["group_id"] >= 0)
         proj_count = (
-            int(self.metric_loss.valid_anchors(batch["group_id"][is_oven]).sum())
+            int(self.metric_loss.valid_anchors(batch["group_id"][device_known]).sum())
             if isinstance(self.metric_loss, SupConLoss)
-            else int(is_oven.sum())
+            else int(device_known.sum())
         )
         return {
             "is_oven": int(is_oven.numel()),
@@ -199,7 +200,7 @@ class MultiTaskLoss(nn.Module):
             "food": int(batch["food_known"].sum()),
             "container": int(batch["container_known"].sum()),
             "accessory": int(batch["accessory_known"].sum()),
-            "rack": int((is_oven & batch["rack_known"]).sum()),
+            "rack": int((device_known & batch["rack_known"]).sum()),
         }
 
     def forward(
@@ -208,11 +209,12 @@ class MultiTaskLoss(nn.Module):
         batch: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         is_oven = batch["is_oven"] > 0.5
-        has_level = is_oven & batch["rack_known"]           # 一体机内部且非空腔
+        device_known = is_oven & (batch["group_id"] >= 0)
+        has_level = device_known & batch["rack_known"]
         bce = F.binary_cross_entropy_with_logits
         terms = {
             "is_oven": bce(out["is_oven"].float(), batch["is_oven"].float()),
-            "proj": masked_loss(self.metric_loss, out["proj"], batch["group_id"], is_oven),
+            "proj": masked_loss(self.metric_loss, out["proj"], batch["group_id"], device_known),
             "food": masked_loss(lambda p, t: bce(p.float(), t.float()), out["food"], batch["food"], batch["food_known"]),
             "container": masked_loss(self.container_loss, out["container"], batch["container"], batch["container_known"]),
             "accessory": masked_loss(self.accessory_loss, out["accessory"], batch["accessory"], batch["accessory_known"]),

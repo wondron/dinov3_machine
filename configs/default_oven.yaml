@@ -28,7 +28,7 @@ labels:
   container: [玻璃容器, 塑料容器, 陶瓷容器, 泡沫容器, 金属容器, 木质/竹制容器, 纸质容器, 珐琅锅, 保鲜膜, 铝箔纸]
   accessory: [玻璃蒸烤盘, 脆烤盘, 微波专用烤架, 烤架, 炸烤网架, 烤盘, 有孔蒸盘, 无孔蒸盘, 小炸篮, 转轴烤叉, 旋转烤串, 炸烤盘, 遮挡]
   safety_container: [金属容器, 铝箔纸, 泡沫容器]          # 按召回率目标定阈值
-  none_tokens: ["无"]                                 # 列表里出现视为空列表；device_model / rack_level / food_name 出现视为 null / 无
+  none_tokens: ["无"]                                 # “无”是空值标记；“未知”是外部设备，不能加在这里；图片标注显式 null 表示确认没有
 
 # 设备配置表：rack_count、floor_usable、cavity_group、支持的附件
 device_profile: configs/device_profile.json
@@ -67,6 +67,7 @@ sampler:
   type: pk                             # pk：每个 batch 取 P 个型号 × K 张，各型号（cavity_group）等概率；random：普通打乱
   p_groups: 4                          # SupCon 启用时实际 P 会按型号数和 batch 容量下调，保证 P>=2、每组 K>=2
   non_oven_ratio: 0.25                 # 非一体机目标占比；SupCon 至少保留 4 张一体机，不足时降低该占比；无非一体机时为 0
+  unknown_oven_ratio: 0.25             # 外部“未知”内腔目标占比；无此类数据时为 0；配额不足时优先保证公司型号的 SupCon 正负样本
 
 # =========================
 # Loss
@@ -79,7 +80,7 @@ loss:
     container: 1.0
     accessory: 1.0
     rack: 1.0
-  metric: supcon                       # 型号特征的度量学习：supcon / arcface（只用一体机样本，按 cavity_group 区分）
+  metric: supcon                       # 型号特征的度量学习：supcon / arcface（只用已知公司型号，按 cavity_group 区分）
   supcon_temperature: 0.1
   arcface_scale: 30.0
   arcface_margin: 0.3
@@ -115,7 +116,7 @@ eval:
   gallery_max_per_model: 200           # 每个型号最多从训练集取多少张参考图建特征库
   gallery_feature: proj                # 型号检索用的特征：proj（Proj Head）/ cls（骨干 CLS），两种都会评估；留一型号验证会按结果改成更好的一种
   knn_k: 10
-  tau: 0.5                             # 未知型号阈值默认值；特征库有 2 个以上 cavity_group 时由阶段 2 近似标定，留一型号验证再精确标定
+  tau: 0.5                             # 拒识相似度默认阈值；阶段 2 优先用真实外部验证图标定，无外部时按 cavity_group 近似留一标定
   default_threshold: 0.5               # 多标签 / 二分类阈值默认值
   safety_recall_target: 0.95           # 安全相关容器类别的召回率目标
   rack_target_precision: 0.95          # 层位置信度阈值：高于阈值的预测要达到的准确率

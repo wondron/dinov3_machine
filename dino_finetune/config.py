@@ -218,6 +218,9 @@ def _validate_labels(labels: dict[str, Any]) -> None:
     clash = [t for t in none_tokens if t in container or t in accessory]
     if clash:
         raise ValueError(f"labels.none_tokens 不能和类别名重复：{clash}")
+    external_tokens = [t for t in none_tokens if t in {"未知", "未知型号"}]
+    if external_tokens:
+        raise ValueError(f"labels.none_tokens 不能包含外部设备标记：{external_tokens}")
 
 
 def _validate_data(data: dict[str, Any]) -> None:
@@ -280,6 +283,7 @@ def _validate_sampler(sampler: dict[str, Any]) -> None:
     _choice(sampler, "type", ctx, ("pk", "random"), default="pk")
     _int(sampler, "p_groups", ctx, default=4, lo=1)
     _float(sampler, "non_oven_ratio", ctx, default=0.25, lo=0.0, hi=1.0, hi_open=True)
+    _float(sampler, "unknown_oven_ratio", ctx, default=0.25, lo=0.0, hi=1.0, hi_open=True)
 
 
 def _validate_loss(loss: dict[str, Any]) -> None:

@@ -195,28 +195,39 @@ def calibrate_tau(
     gallery: DeviceGallery,
     feats: torch.Tensor,
     models: Sequence[str],
+    *,
+    external: Sequence[bool] | None = None,
 ) -> dict[str, Any] | None:
     """
-    快速标定未知型号阈值 tau（训练结束时的默认做法）：
+    快速标定未知型号阈值 tau，优先使用验证集中明确标注的外部设备：
+      - 有真实外部与库内查询图时，用两者对完整特征库的相似度标定，单个 cavity_group 也可用；
+      - 否则使用下面的留一内腔组近似，至少需要 2 个 cavity_group。
       - 库内：验证集图片对完整特征库的 top-1 相似度，应当接受；
       - 库外：把图片所属 cavity_group 从特征库里临时拿掉后的 top-1 相似度，应当拒识。
     这是留一型号验证的近似（模型训练时见过该型号）；完整做法见 script/4-留一型号验证.py。
-    特征库不足 2 个 cavity_group 时无法标定，返回 None。
+    缺少可标定的正负样本时返回 None。
     """
     groups = sorted({gallery.group(m) for m in gallery.labels})
-    if len(groups) < 2:
-        return None
-    in_idx = [i for i, m in enumerate(models) if gallery.group(m) in groups]
+    external = [False] * len(models) if external is None else list(external)
+    if len(external) != len(models):
+        raise ValueError("external 标记数量与型号数量不一致")
+    in_idx = [i for i, m in enumerate(models) if not external[i] and gallery.group(m) in groups]
     if not in_idx:
         return None
 
     s_in = gallery.top1_similarity(feats[in_idx])
+    out_idx = [i for i, flag in enumerate(external) if flag]
+    if out_idx:
+        s_out = gallery.top1_similarity(feats[out_idx])
+        return {**choose_tau(s_in.numpy(), s_out.numpy()), "method": "external"}
+    if len(groups) < 2:
+        return None
     s_out = []
     for group in groups:
         idx = [i for i in in_idx if gallery.group(models[i]) == group]
         if idx:
             s_out.append(gallery.without_group(group).top1_similarity(feats[idx]))
-    return choose_tau(s_in.numpy(), torch.cat(s_out).numpy())
+    return {**choose_tau(s_in.numpy(), torch.cat(s_out).numpy()), "method": "gallery_loo"}
 
 
 def choose_tau(s_in: np.ndarray, s_out: np.ndarray) -> dict[str, Any]:

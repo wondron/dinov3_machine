@@ -151,8 +151,8 @@ TARGET_KEYS = (
 
 class OvenDataset(Dataset):
     """
-    把 OvenLabel 编码成各任务的训练目标。null 标签填占位值，并用 *_known 掩码标出，最终由 loss 掩码排除。
-    非一体机样本：rack_count = max_rack、floor_usable = True、group_id = -1（不参与层位和型号 loss）。
+    把 OvenLabel 编码成各任务的训练目标。未标注任务填占位值，并由 *_known 掩码排除。
+    外部内腔 group_id=-2，非内腔 group_id=-1；二者都不参与型号及层位 loss。
     """
 
     def __init__(
@@ -188,8 +188,11 @@ class OvenDataset(Dataset):
 
         for i, label in enumerate(self.labels):
             if label.is_oven:
-                spec = profile[label.device_model]
                 self.is_oven[i] = 1.0
+            if label.is_oven and label.is_external:
+                self.group_id[i] = -2
+            elif label.device_known:
+                spec = profile[label.device_model]
                 self.rack_count[i] = spec.rack_count
                 self.floor_usable[i] = spec.floor_usable
                 self.group_id[i] = group_index[spec.cavity_group]
@@ -256,7 +259,7 @@ class _Cycle:
 
 class PKBatchSampler(Sampler[list[int]]):
     """
-    PK 采样（设计文档 4.3）：每个 batch 随机取 P 个 cavity_group，每组取 K 张一体机图片，再补一定比例的非一体机图片。
+    每个 batch 随机取 P 个公司 cavity_group，再分别补充非内腔、外部内腔样本。
     各组被选中的概率相同，数据少的机型不会被数据多的机型淹没（设计文档 4.5 的按型号均衡采样）。
     组内样本不足 K 张时会在同一 batch 内重复出现（增强不同）。
     """
@@ -270,11 +273,15 @@ class PKBatchSampler(Sampler[list[int]]):
         num_batches: int,
         seed: int = 0,
         require_supcon: bool = False,
+        unknown_oven_ratio: float = 0.25,
     ) -> None:
         group_ids = np.asarray(group_ids)
+        if np.any(group_ids < -2):
+            raise ValueError("group_id 必须是公司型号组编号、-1（非内腔）或 -2（外部内腔）")
         self.pools = {int(g): np.flatnonzero(group_ids == g) for g in np.unique(group_ids[group_ids >= 0])}
-        self.non_oven = np.flatnonzero(group_ids < 0)
-        if not self.pools and len(self.non_oven) == 0:
+        self.non_oven = np.flatnonzero(group_ids == -1)
+        self.unknown_oven = np.flatnonzero(group_ids == -2)
+        if not self.pools and len(self.non_oven) == 0 and len(self.unknown_oven) == 0:
             raise ValueError("训练集为空，无法采样")
 
         self.require_supcon = bool(require_supcon)
@@ -293,22 +300,38 @@ class PKBatchSampler(Sampler[list[int]]):
                     "请补充不同组的一体机样本，或将 loss.weights.proj 设为 0。"
                 )
 
-        if not self.pools:
-            n_non_oven = batch_size
-        elif len(self.non_oven) == 0:
-            n_non_oven = 0
-        else:
-            requested_non_oven = int(round(batch_size * non_oven_ratio))
+        requested_non_oven = int(round(batch_size * non_oven_ratio)) if len(self.non_oven) else 0
+        requested_unknown = int(round(batch_size * unknown_oven_ratio)) if len(self.unknown_oven) else 0
+        if self.pools:
             min_oven = 4 if self.require_supcon else 2
-            n_non_oven = min(requested_non_oven, max(batch_size - min_oven, 0))
+            capacity = max(batch_size - min_oven, 0)
+            n_non_oven, n_unknown = self._allocate_counts(
+                [requested_non_oven, requested_unknown], capacity,
+            )
             if self.require_supcon and n_non_oven != requested_non_oven:
                 logger.warning(
                     "SupCon + PK：非一体机配额从 %d 调整为 %d（batch_size=%d），"
                     "为至少 2 个组各保留 2 张一体机图片。",
                     requested_non_oven, n_non_oven, batch_size,
                 )
+            if self.require_supcon and n_unknown != requested_unknown:
+                logger.warning(
+                    "SupCon + PK：外部内腔配额从 %d 调整为 %d（batch_size=%d），"
+                    "为至少 2 个公司组各保留 2 张图片。",
+                    requested_unknown, n_unknown, batch_size,
+                )
+        else:
+            # 关闭型号任务时允许仅用属性数据；按两类的目标比例填满 batch。
+            weights = [
+                float(non_oven_ratio) if len(self.non_oven) else 0.0,
+                float(unknown_oven_ratio) if len(self.unknown_oven) else 0.0,
+            ]
+            if not sum(weights):
+                weights = [len(self.non_oven), len(self.unknown_oven)]
+            n_non_oven, n_unknown = self._allocate_counts(weights, batch_size, fill=True)
         self.n_non_oven = n_non_oven
-        self.n_oven = batch_size - n_non_oven
+        self.n_unknown_oven = n_unknown
+        self.n_oven = batch_size - n_non_oven - n_unknown
         self.p = min(int(p_groups), len(self.pools))
         if self.require_supcon:
             self.p = min(self.p, self.n_oven // 2)
@@ -322,10 +345,26 @@ class PKBatchSampler(Sampler[list[int]]):
         self.seed = int(seed)
         self.epoch = 0
 
+    @staticmethod
+    def _allocate_counts(requested: Sequence[float], capacity: int, *, fill: bool = False) -> list[int]:
+        """不足时按目标比例缩减，并以最大余数法分配整数名额。"""
+        weights = np.asarray(requested, dtype=float)
+        total = float(weights.sum())
+        if not total or capacity <= 0:
+            return [0] * len(weights)
+        if not fill and total <= capacity:
+            return [int(value) for value in weights]
+        scaled = weights * capacity / total
+        counts = np.floor(scaled).astype(int)
+        order = np.argsort(-(scaled - counts), kind="stable")
+        for index in order[:capacity - int(counts.sum())]:
+            counts[index] += 1
+        return counts.tolist()
+
     def describe(self) -> str:
         return (
-            f"PK 采样：groups={len(self.pools)} P={self.p} 一体机/batch={self.n_oven} "
-            f"非一体机/batch={self.n_non_oven} batches={self.num_batches}"
+            f"PK 采样：groups={len(self.pools)} P={self.p} 公司型号/batch={self.n_oven} "
+            f"非一体机/batch={self.n_non_oven} 外部内腔/batch={self.n_unknown_oven} batches={self.num_batches}"
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -338,6 +377,7 @@ class PKBatchSampler(Sampler[list[int]]):
         rng = np.random.default_rng(self.seed + self.epoch)
         cycles = {g: _Cycle(idx, rng) for g, idx in self.pools.items()}
         non_oven = _Cycle(self.non_oven, rng) if len(self.non_oven) else None
+        unknown_oven = _Cycle(self.unknown_oven, rng) if len(self.unknown_oven) else None
         groups = np.array(sorted(self.pools))
         for _ in range(self.num_batches):
             batch: list[int] = []
@@ -347,6 +387,8 @@ class PKBatchSampler(Sampler[list[int]]):
                     batch += cycles[int(g)].take(base + (1 if j < extra else 0))
             if non_oven is not None and self.n_non_oven > 0:
                 batch += non_oven.take(self.n_non_oven)
+            if unknown_oven is not None and self.n_unknown_oven > 0:
+                batch += unknown_oven.take(self.n_unknown_oven)
             yield batch
 
 
@@ -371,6 +413,7 @@ def build_train_loader(
             batch_size=batch_size,
             p_groups=sampler_cfg["p_groups"],
             non_oven_ratio=sampler_cfg["non_oven_ratio"],
+            unknown_oven_ratio=sampler_cfg.get("unknown_oven_ratio", 0.25),
             num_batches=steps_per_epoch,
             seed=seed,
             require_supcon=require_supcon,

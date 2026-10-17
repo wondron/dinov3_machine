@@ -141,6 +141,57 @@ class PKSamplerTests(unittest.TestCase):
         random_loader = self.loader([-1, -1], batch_size=1, sampler_cfg={"type": "random"})
         self.assertEqual(sorted(int(batch.item()) for batch in random_loader), [0, 1])
 
+    def test_external_and_non_oven_have_separate_quotas(self) -> None:
+        groups = self.groups + [-2] * 8
+        sampler = self.sampler(group_ids=groups)
+        self.assertEqual((sampler.n_oven, sampler.n_non_oven, sampler.n_unknown_oven), (8, 4, 4))
+        for batch in sampler:
+            counts = Counter(groups[index] for index in batch)
+            self.assertEqual(counts.pop(-1), 4)
+            self.assertEqual(counts.pop(-2), 4)
+            self.assertEqual(len(counts), 4)
+            self.assertTrue(all(count == 2 for count in counts.values()))
+
+    def test_external_quota_is_zero_when_absent_and_uses_its_own_ratio(self) -> None:
+        sampler = self.sampler(unknown_oven_ratio=0.9)
+        self.assertEqual((sampler.n_oven, sampler.n_non_oven, sampler.n_unknown_oven), (12, 4, 0))
+        groups = [0, 0, 1, 1, -2, -2]
+        sampler = self.sampler(group_ids=groups, unknown_oven_ratio=0.5)
+        self.assertEqual((sampler.n_oven, sampler.n_non_oven, sampler.n_unknown_oven), (8, 0, 8))
+        for batch in sampler:
+            counts = Counter(groups[index] for index in batch)
+            self.assertEqual(counts[-2], 8)
+            self.assertEqual(counts.get(-1, 0), 0)
+
+    def test_external_quota_shrinks_to_keep_two_company_pairs(self) -> None:
+        groups = [0, 0, 1, 1, -1, -2]
+        with self.assertLogs("dino_finetune.data", level="WARNING"):
+            sampler = self.sampler(group_ids=groups, batch_size=8, non_oven_ratio=0.5, unknown_oven_ratio=0.5)
+        self.assertEqual((sampler.n_oven, sampler.n_non_oven, sampler.n_unknown_oven), (4, 2, 2))
+        for batch in sampler:
+            self.assertEqual(Counter(groups[index] for index in batch), {0: 2, 1: 2, -1: 2, -2: 2})
+
+    def test_external_only_and_mixed_attribute_batches_fill_without_company_groups(self) -> None:
+        for groups in ([-2, -2], [-1, -2]):
+            with self.subTest(groups=groups):
+                sampler = self.sampler(group_ids=groups, batch_size=8, require_supcon=False)
+                self.assertEqual(sampler.n_oven, 0)
+                self.assertGreater(sampler.n_unknown_oven, 0)
+                for batch in sampler:
+                    self.assertEqual(len(batch), 8)
+                    self.assertIn(-2, [groups[index] for index in batch])
+        with self.assertRaisesRegex(ValueError, "cavity_group"):
+            self.sampler(group_ids=[-2, -2])
+
+    def test_loader_forwards_external_quota(self) -> None:
+        loader = self.loader(
+            [0, 0, 1, 1, -2], batch_size=8,
+            sampler_cfg={"type": "pk", "p_groups": 2, "non_oven_ratio": 0.25, "unknown_oven_ratio": 0.5},
+        )
+        self.assertEqual(loader.batch_sampler.n_unknown_oven, 4)
+        for batch in loader:
+            self.assertEqual(int((batch == 4).sum()), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

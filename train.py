@@ -138,8 +138,8 @@ def check_compatible(ckpt: Mapping[str, Any], cfg: Mapping[str, Any], group_name
 def log_label_summary(split: str, labels: Sequence[OvenLabel]) -> None:
     s = summarize_labels(labels)
     logger.info(
-        "%s：样本=%d 一体机=%d 非一体机=%d 型号=%s",
-        split, s["num_samples"], s["is_oven"], s["non_oven"], s["device_model"],
+        "%s：样本=%d 一体机=%d 外部内腔=%d 非一体机=%d 型号=%s",
+        split, s["num_samples"], s["is_oven"], s["external_oven"], s["non_oven"], s["device_model"],
     )
     logger.info("%s：食物=%s 层位=%s", split, s["food_exist"], s["rack_level"])
     logger.info("%s：容器=%s", split, s["container"])
@@ -152,11 +152,11 @@ def warn_data_coverage(
     profile: Mapping[str, DeviceSpec],
 ) -> None:
     """提示当前数据覆盖不到的任务，便于理解为什么某些 loss / 指标没有意义。"""
-    groups = {profile[lb.device_model].cavity_group for lb in train_labels if lb.is_oven}
+    groups = {profile[lb.device_model].cavity_group for lb in train_labels if lb.device_known}
     if len(groups) < 2:
         logger.warning(
-            "训练集只有 %d 个 cavity_group：Proj Head 的对比学习没有负样本（proj loss 恒为 0），"
-            "tau 也无法标定，将使用 eval.tau 默认值",
+            "训练集只有 %d 个公司 cavity_group：Proj Head 的对比学习没有负样本（proj loss 恒为 0）；"
+            "tau 需要验证集同时包含库内公司和真实外部设备才能标定，否则使用 eval.tau 默认值",
             len(groups),
         )
     if all(lb.is_oven for lb in train_labels):

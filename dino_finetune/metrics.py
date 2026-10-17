@@ -144,10 +144,17 @@ def rack_report(
     }
 
 
-def retrieval_report(matches: Sequence[GalleryMatch], true_models: Sequence[str], gallery: DeviceGallery) -> dict[str, Any]:
+def retrieval_report(
+    matches: Sequence[GalleryMatch],
+    true_models: Sequence[str],
+    gallery: DeviceGallery,
+    *,
+    external: Sequence[bool] | None = None,
+) -> dict[str, Any]:
     """型号检索：库内型号的 top-1 准确率（按 cavity_group 判定）、误拒率，库外型号的拒识率与混淆表。"""
     groups = {gallery.group(m) for m in gallery.labels}
-    in_gallery = [gallery.group(m) in groups for m in true_models]
+    external = [False] * len(true_models) if external is None else list(external)
+    in_gallery = [not ext and gallery.group(m) in groups for m, ext in zip(true_models, external)]
     correct = [m.known and m.group == gallery.group(t) for m, t in zip(matches, true_models)]
     rejected = [not m.known for m in matches]
     confusion: dict[str, Counter] = defaultdict(Counter)
@@ -164,6 +171,9 @@ def retrieval_report(matches: Sequence[GalleryMatch], true_models: Sequence[str]
         "top1": mean_where(correct, in_gallery),
         "unknown_rate": mean_where(rejected, in_gallery),
         "unseen_reject_rate": mean_where(rejected, unseen),
+        "n_external": int(sum(external)),
+        "external_reject_rate": mean_where(rejected, external),
+        "external_false_accept_rate": mean_where([not r for r in rejected], external),
         "mean_top1_sim": float(np.mean([m.top1_sim for m in matches])) if matches else None,
         "confusion": {model: dict(counter) for model, counter in sorted(confusion.items())},
     }
@@ -184,7 +194,7 @@ def cascade_report(
     num_pos = arrays["rack_raw"].shape[1]
     device_ok, rack_ok = [], []
     for match, row in zip(matches, rows):
-        if not arrays["rack_known"][row]:
+        if not arrays["rack_known"][row] or models[row] not in profile:
             continue
         device_ok.append(match.known and match.group == gallery.group(models[row]))
         if match.known and match.model in profile:
@@ -241,6 +251,8 @@ def evaluate_outputs(
     rows_all = np.arange(len(arrays["index"]))
     models = [labels[i].device_model for i in arrays["index"]]
     is_oven = arrays["is_oven"] > 0.5
+    device_known = np.array([labels[i].device_known and labels[i].device_model in profile for i in arrays["index"]], dtype=bool)
+    external = np.array([labels[i].is_external for i in arrays["index"]], dtype=bool)
     flat: dict[str, float | None] = {}
     report: dict[str, Any] = {"n": int(len(rows_all))}
 
@@ -271,7 +283,7 @@ def evaluate_outputs(
             report["accessory"][key] = result
             flat["accessory_map" if key == "all" else f"accessory_map_{key}"] = result["map"]
 
-    sel = is_oven & arrays["rack_known"]
+    sel = device_known & arrays["rack_known"]
     if sel.any():
         result = rack_report(
             arrays["rack_logits"][sel],
@@ -289,11 +301,15 @@ def evaluate_outputs(
             continue
         feats = torch.from_numpy(arrays[name][oven_rows])
         matches = gallery.query_batch(feats, k=calibration["knn_k"], tau=calibration["tau"][name])
-        result = retrieval_report(matches, [models[i] for i in oven_rows], gallery)
+        result = retrieval_report(matches, [models[i] for i in oven_rows], gallery, external=external[oven_rows])
         report[f"device_{name}"] = result
         flat[f"device_top1_{name}"] = result["top1"]
+        flat[f"external_reject_rate_{name}"] = result["external_reject_rate"]
+        flat[f"external_false_accept_rate_{name}"] = result["external_false_accept_rate"]
         if name == calibration["gallery_feature"]:
             flat["device_top1"] = result["top1"]
+            flat["external_reject_rate"] = result["external_reject_rate"]
+            flat["external_false_accept_rate"] = result["external_false_accept_rate"]
             cascade = cascade_report(matches, oven_rows, arrays, models, profile, gallery)
             report["cascade"] = cascade
             flat["rack_acc_e2e"] = cascade["rack_acc_e2e"]
@@ -377,6 +393,7 @@ def calibrate_thresholds(
     cal = default_calibration(eval_cfg, container_classes, accessory_classes)
     sources: dict[str, str] = {}
     is_oven = arrays["is_oven"] > 0.5
+    device_known = np.array([labels[i].device_known for i in arrays["index"]], dtype=bool)
 
     cal["is_oven_threshold"], sources["is_oven"] = best_f1_threshold(arrays["is_oven_prob"], is_oven, default)
     known = arrays["food_known"]
@@ -396,7 +413,7 @@ def calibrate_thresholds(
         thr, src = best_f1_threshold(arrays["accessory_prob"][known, c], arrays["accessory"][known, c] > 0.5, default)
         cal["accessory_thresholds"][name], sources[f"accessory/{name}"] = thr, src
 
-    sel = is_oven & arrays["rack_known"]
+    sel = device_known & arrays["rack_known"]
     prob = masked_softmax(arrays["rack_logits"][sel]) if sel.any() else np.zeros((0, 1))
     cal["rack_conf_threshold"], sources["rack_conf"] = rack_confidence_threshold(
         prob.max(1) if len(prob) else np.zeros(0),
@@ -407,16 +424,17 @@ def calibrate_thresholds(
 
     oven_rows = np.flatnonzero(is_oven)
     models = [labels[arrays["index"][row]].device_model for row in oven_rows]
+    external = [labels[arrays["index"][row]].is_external for row in oven_rows]
     cal["tau_calibration"] = {}
     for name, gallery in galleries.items():
         result = None
         if len(gallery) and len(oven_rows):
-            result = calibrate_tau(gallery, torch.from_numpy(arrays[name][oven_rows]), models)
+            result = calibrate_tau(gallery, torch.from_numpy(arrays[name][oven_rows]), models, external=external)
         if result is None:
-            sources[f"tau/{name}"] = "default(需要 2 个以上 cavity_group)"
+            sources[f"tau/{name}"] = "default(需要库内及外部验证图，或 2 个以上 cavity_group)"
         else:
             cal["tau"][name] = result["tau"]
-            sources[f"tau/{name}"] = "gallery_loo"
+            sources[f"tau/{name}"] = result["method"]
             cal["tau_calibration"][name] = result
     cal["sources"] = sources
     return cal

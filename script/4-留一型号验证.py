@@ -91,7 +91,7 @@ def split_queries(
     train_by, val_by = defaultdict(list), defaultdict(list)
     for labels, by_group in ((train_labels, train_by), (val_labels, val_by)):
         for lb in labels:
-            if lb.is_oven:
+            if lb.device_known:
                 by_group[profile[lb.device_model].cavity_group].append(lb)
 
     references, out_queries, in_queries = {}, {}, {}
@@ -220,6 +220,9 @@ def apply_to_calibration(run_dir: Path, report: Mapping[str, Any]) -> None:
     if not backup.exists():
         backup.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
     for name in FEATURES:
+        if calibration.get("sources", {}).get(f"tau/{name}") == "external":
+            logger.info("%s 的 tau 已由真实外部验证图标定，保留该阈值；LOO 结果仍写入报告", name)
+            continue
         summary = report["features"].get(name, {})
         if summary.get("tau") is not None:
             calibration["tau"][name] = summary["tau"]
@@ -262,7 +265,7 @@ def main() -> None:
         split_labels[key] = exclude_groups(labels, profile, data_cfg["exclude_groups"])
     train_labels, val_labels = split_labels["train_split"], split_labels["val_split"]
 
-    counts = Counter(profile[lb.device_model].cavity_group for lb in train_labels if lb.is_oven)
+    counts = Counter(profile[lb.device_model].cavity_group for lb in train_labels if lb.device_known)
     if len(counts) < 2:
         raise SystemExit(f"训练集只有 {len(counts)} 个 cavity_group（{dict(counts)}），留一型号验证至少需要 2 个")
     eligible = sorted(g for g, c in counts.items() if c >= loo_cfg["min_group_images"])

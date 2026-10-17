@@ -125,6 +125,52 @@ class EvaluationLossTests(unittest.TestCase):
         self.assertEqual(len(arrays["index"]), 8)
         self.assertEqual(losses, {})
 
+    def test_external_interiors_train_attributes_without_device_or_rack_gradients(self):
+        rows = rows_for([0, 0, 1, 1, -2, -2, -1, -1])
+        for row in rows[4:6]:
+            row["is_oven"] = torch.tensor(1.)
+            for key in ("food_known", "container_known", "accessory_known", "rack_known"):
+                row[key] = torch.tensor(True)
+            # 即使不适用层位被意外标成已知，也必须先由型号掩码排除。
+            row["rack_level"] = torch.tensor(999)
+        batch = next(iter(DataLoader(rows, batch_size=8)))
+        for metric in (SupConLoss(), ArcFaceLoss(4, 2)):
+            with self.subTest(metric=type(metric).__name__):
+                loss_fn = criterion(metric)
+                model = TableModel()
+                out = {key: value.detach().clone().requires_grad_() for key, value in model(
+                    batch["image"], batch["rack_count"], batch["floor_usable"],
+                ).items()}
+                total, terms = loss_fn(out, batch)
+                counts = loss_fn.effective_counts(batch)
+                self.assertEqual(counts["proj"], 4)
+                self.assertEqual(counts["rack"], 2)
+                self.assertEqual(counts["is_oven"], 8)
+                expected = metric(out["proj"][:4], batch["group_id"][:4])
+                self.assertAlmostEqual(terms["proj"].item(), expected.item(), places=6)
+                total.backward()
+                self.assertEqual(float(out["proj"].grad[4:].abs().sum()), 0.0)
+                self.assertEqual(float(out["rack"].grad[4:].abs().sum()), 0.0)
+                for name in ("food", "container", "accessory", "is_oven"):
+                    self.assertGreater(float(out[name].grad[4:6].abs().sum()), 0.0)
+
+    def test_external_only_batches_have_no_metric_or_rack_denominator(self):
+        rows = rows_for([-2] * 8)
+        for row in rows:
+            row["is_oven"] = torch.tensor(1.)
+            row["rack_known"] = torch.tensor(True)
+            row["rack_level"] = torch.tensor(999)
+        for metric in (SupConLoss(), ArcFaceLoss(4, 2)):
+            with self.subTest(metric=type(metric).__name__):
+                loss_fn = criterion(metric)
+                batch = next(iter(DataLoader(rows, batch_size=8)))
+                self.assertEqual(loss_fn.effective_counts(batch)["proj"], 0)
+                self.assertEqual(loss_fn.effective_counts(batch)["rack"], 0)
+                _, losses = evaluate(TableModel(), rows, loss_fn, batch_size=3)
+                self.assertEqual(losses["loss_proj"], 0.0)
+                self.assertEqual(losses["loss_rack"], 0.0)
+                self.assertGreater(losses["loss_is_oven"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

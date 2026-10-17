@@ -6,7 +6,8 @@
   - 规范格式（v2）：顶层直接给出 is_oven / device_model / food_exist / container_type / accessory_type / rack_level；
   - 标注工具导出格式（annotation_version 1.x）：字段放在 "annotations" 下，没有 is_oven / food_exist，
     用 food_name 表示食物，列表里用 "无" 表示空，rack_level 是字符串列表（如 ["3"]、["无"]）。
-解析后统一成 OvenLabel：空列表 [] 表示"无"，None 表示不适用 / 未标注（训练时由 loss 掩码排除）。
+显式 null 表示确认没有；容器、附件解析为空列表，食物解析为 false。
+解析后的 None 仅表示不适用 / 未标注（训练时由 loss 掩码排除）。
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from .device import DeviceSpec
 logger = logging.getLogger(__name__)
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+EXTERNAL_DEVICE_MODELS = frozenset({"未知", "未知型号"})
 
 
 @dataclass
@@ -34,6 +36,16 @@ class OvenLabel:
     container: list[str] | None
     accessory: list[str] | None
     rack_level: int | None
+
+    @property
+    def is_external(self) -> bool:
+        """明确为非本司的一体机，原始型号标注保持不变。"""
+        return self.device_model in EXTERNAL_DEVICE_MODELS
+
+    @property
+    def device_known(self) -> bool:
+        """是否具有可用于公司型号及层位任务的型号标注。"""
+        return self.is_oven and self.device_model is not None and not self.is_external
 
     @property
     def has_item(self) -> bool:
@@ -100,16 +112,15 @@ def _parse_names(
     
     value = ann[key]
     if value is None:
-        return None
-
-    if '遮挡' in value:
-        report("warning", "遮挡", f"{key} 中包含“遮挡”，按照“无”处理")
-        return None
+        return []
     
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):
         report("error", "bad_type", f"{key} 必须是列表，实际为 {type(value).__name__}")
+        return None
+    if any(isinstance(item, str) and item.strip() == "遮挡" for item in value):
+        report("warning", "遮挡", f"{key} 中包含“遮挡”，按未标注处理")
         return None
 
     names: list[str] = []
@@ -177,7 +188,11 @@ def parse_annotation(json_path: str | Path, schema: LabelSchema) -> tuple[OvenLa
     if image_path is None:
         report("error", "missing_image", "找不到对应的图片文件")
 
-    device_model = None if schema.is_none(ann.get("device_model")) else str(ann["device_model"]).strip()
+    model_value = ann.get("device_model")
+    model_name = str(model_value).strip() if model_value is not None else None
+    device_model = model_name if model_name in EXTERNAL_DEVICE_MODELS else (
+        None if schema.is_none(model_value) else model_name
+    )
 
     is_oven = ann.get("is_oven")
     if is_oven is None:
@@ -187,15 +202,21 @@ def parse_annotation(json_path: str | Path, schema: LabelSchema) -> tuple[OvenLa
 
     if "food_exist" in ann:
         food_exist = ann["food_exist"]
-        if food_exist is not None and not isinstance(food_exist, bool):
+        if food_exist is None:
+            food_exist = False
+        elif not isinstance(food_exist, bool):
             report("error", "bad_type", f"food_exist 必须是 true / false / null，实际为 {food_exist!r}")
     elif "food_name" in ann:
         food_name = ann["food_name"]
         if food_name is None:
-            food_exist = None
+            food_exist = False
         else:
             names = food_name if isinstance(food_name, list) else [food_name]
-            food_exist = any(not schema.is_none(n) for n in names)
+            if any(isinstance(name, str) and name.strip() == "遮挡" for name in names):
+                food_exist = None
+                report("warning", "遮挡", "food_name 中包含“遮挡”，按未标注处理")
+            else:
+                food_exist = any(not schema.is_none(n) for n in names)
     else:
         food_exist = None
         report("warning", "missing_field", "缺少 food_exist / food_name，食物标签按未标注处理")
@@ -231,6 +252,9 @@ def check_label_rules(label: OvenLabel, profile: Mapping[str, DeviceSpec]) -> li
     if label.is_oven:
         if label.device_model is None:
             report("error", "missing_device", "is_oven=true 时 device_model 必填")
+        elif label.is_external:
+            # 外部设备不适用公司型号配置，也不监督层位。
+            return issues
         elif label.device_model not in profile:
             report("error", "unknown_device", f"型号 {label.device_model} 不在 Device Profile 中，请先补充该型号的配置")
         else:
@@ -329,6 +353,8 @@ def summarize_labels(labels: Sequence[OvenLabel]) -> dict[str, Any]:
         "num_samples": len(labels),
         "is_oven": sum(lb.is_oven for lb in labels),
         "non_oven": sum(not lb.is_oven for lb in labels),
+        "external_oven": sum(lb.is_oven and lb.is_external for lb in labels),
+        "known_device": sum(lb.device_known for lb in labels),
         "device_model": dict(Counter(lb.device_model for lb in labels if lb.is_oven)),
         "food_exist": dict(Counter({True: "true", False: "false", None: "null"}[lb.food_exist] for lb in labels)),
         "container": dict(Counter(n for lb in labels for n in (lb.container or []))),
