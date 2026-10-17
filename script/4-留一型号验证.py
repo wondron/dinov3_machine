@@ -27,6 +27,7 @@ import logging
 import re
 import subprocess
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -119,9 +120,29 @@ def train_fold(cfg: Mapping[str, Any], run_dir: Path, fold_dir: Path, group: str
     fold_cfg["device_profile"] = str(run_dir / "device_profile.json")
     if epochs > 0:
         fold_cfg["trainparams"]["epochs"] = epochs
-    fold_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = fold_dir / "fold_config.yaml"
+    # 配置必须在训练输出目录之外，新训练会拒绝非空输出目录。
+    config_dir = fold_dir.parent / "fold_configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = config_dir / f"{fold_dir.name}.yaml"
     cfg_path.write_text(yaml.safe_dump(fold_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    if fold_dir.exists() and any(fold_dir.iterdir()):
+        # 重训和失败重跑都保留旧结果；只在同一个 loo 目录内移动。
+        parent = fold_dir.parent.resolve()
+        if fold_dir.is_symlink() or fold_dir.resolve().parent != parent:
+            raise ValueError(f"折目录不能指向 loo 目录之外：{fold_dir}")
+        timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%y%m%d_%H%M%S")
+        suffix = 0
+        while True:
+            name = f"{fold_dir.name}.previous_{timestamp}" + (f"_{suffix:02d}" if suffix else "")
+            backup = parent / name
+            if backup.resolve().parent != parent:
+                raise ValueError(f"折归档目录不在 loo 目录内：{backup}")
+            if not backup.exists():
+                fold_dir.rename(backup)
+                logger.info("原折结果已保留在 %s", backup)
+                break
+            suffix += 1
 
     cmd = [sys.executable, str(PROJECT_ROOT / "train.py"), "--config", str(cfg_path), "--output_dir", str(fold_dir), "--device", device]
     logger.info("训练第 %s 折（留出 %s）：%s", fold_dir.name, group, " ".join(cmd))

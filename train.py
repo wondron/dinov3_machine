@@ -22,7 +22,7 @@ import math
 import random
 from collections import Counter, defaultdict
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -89,6 +89,39 @@ def pick_device(name: str) -> torch.device:
     if name == "auto":
         name = "cuda" if torch.cuda.is_available() else "cpu"
     return torch.device(name)
+
+
+def prepare_run_dir(
+    cfg: Mapping[str, Any],
+    *,
+    output_dir: str | Path | None = None,
+    resume_path: Path | None = None,
+) -> Path:
+    """分配训练目录；新训练不覆盖已有结果，续训保留原目录。"""
+    if resume_path is not None:
+        run_dir = resume_path.parent
+        if output_dir is not None and Path(output_dir).expanduser().resolve() != run_dir:
+            raise ValueError("--resume 必须沿用 checkpoint 所在目录，不能另指定 --output_dir")
+        return run_dir
+
+    if output_dir is not None:
+        run_dir = Path(output_dir).expanduser().resolve()
+        if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
+            raise FileExistsError(f"输出目录已存在且非空，拒绝覆盖：{run_dir}；请使用新目录，或用 --resume 续训")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    root = resolve_path(cfg["output"]["root"]).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone(timedelta(hours=8))).strftime("%y%m%d_%H%M%S")
+    suffix = 0
+    while True:
+        run_dir = root / (timestamp if suffix == 0 else f"{timestamp}_{suffix:02d}")
+        try:
+            run_dir.mkdir()  # 不使用 exist_ok，防止同时启动的训练共用同一目录。
+            return run_dir
+        except FileExistsError:
+            suffix += 1
 
 
 def set_seed(seed: int) -> None:
@@ -249,26 +282,14 @@ def main() -> None:
         else:
             cfg = resume_ckpt["cfg"]
             validate_config(cfg)
-        run_dir = resume_path.parent
     else:
         cfg = load_config(args.config)
-        if args.output_dir:
-            run_dir = Path(args.output_dir).expanduser().resolve()
-        else:
-            run_dir = resolve_path(cfg["output"]["root"]) / datetime.now().strftime("%y%m%d")
-
-    if run_dir.exists():
-        import shutil
-        shutil.rmtree(run_dir)
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(name="train", log_file=str(run_dir / "train.log"), use_shanghai_time=True)
 
     device = pick_device(args.device)
+    run_dir = prepare_run_dir(cfg, output_dir=args.output_dir, resume_path=resume_path)
     tp, ev = cfg["trainparams"], cfg["eval"]
     use_amp = bool(tp["use_amp"] and device.type == "cuda")
     set_seed(tp["seed"])
-    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     logger.info("输出目录：%s", run_dir)
     if resume_path is not None:
         logger.info("续训 checkpoint：%s", resume_path)
@@ -285,7 +306,6 @@ def main() -> None:
     )
     group_names = group_names_of(profile)
     logger.info("Device Profile：%d 个型号，%d 个 cavity_group", len(profile), len(group_names))
-    write_json(run_dir / "device_profile.json", {name: spec.to_dict() for name, spec in profile.items()})
 
     data_cfg = cfg["data"]
     roots = [resolve_path(root) for root in data_cfg["root"]]
@@ -305,7 +325,6 @@ def main() -> None:
             raise RuntimeError(f"{split} 划分没有可用样本")
         split_labels[key] = labels
         log_label_summary(split, labels)
-    write_json(run_dir / "label_issues.json", label_issues)
     warn_data_coverage(split_labels["train"], split_labels["val"], profile)
 
     # =========================
@@ -413,6 +432,12 @@ def main() -> None:
             init_path, len(missing), len(unexpected),
         )
         del init_ckpt
+
+    # 设备、数据、模型及 checkpoint 校验通过后再更新运行快照，失败不会改写续训记录。
+    setup_logging(name="train", log_file=str(run_dir / "train.log"), use_shanghai_time=True)
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    write_json(run_dir / "device_profile.json", {name: spec.to_dict() for name, spec in profile.items()})
+    write_json(run_dir / "label_issues.json", label_issues)
 
     logger.info("========== 训练参数配置 ==========")
     logger.info("epochs=%d batch_size=%d steps_per_epoch=%d total_steps=%d", tp["epochs"], batch_size, steps_per_epoch, total_steps)
@@ -574,6 +599,7 @@ def main() -> None:
         return
     best_ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
     model.load_trainable_state_dict(best_ckpt["model"])
+    criterion.load_state_dict(best_ckpt["criterion"])
     best_epoch = int(best_ckpt["epoch"])
     logger.info("阶段 2：加载 %s（第 %d 轮，score=%.4f）", best_path.name, best_epoch + 1, float(best_ckpt["score"]))
     del best_ckpt

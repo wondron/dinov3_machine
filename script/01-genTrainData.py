@@ -2,6 +2,7 @@
 
 源标注不修改。输出仍兼容 annotations 1.x 格式，并补齐明确的训练标签：
 未知设备保留食物/容器/附件，is_oven=true，rack_level=null；
+多层位图片保留其它任务标签，单层位任务不监督，并记录原始层位；
 已出现字段的 null 表示确认没有，缺失字段和“遮挡”保留为未标注。
 """
 from __future__ import annotations
@@ -24,9 +25,10 @@ from tqdm import tqdm
 # 配置
 # ==================================================
 # 原始数据路径
-SRC_PATH = r"/data/wangzhuo/66-newdata/00-dataset/03-多属性/01-oridata"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_PATH = PROJECT_ROOT / "data" / "00-origin_data"
 # 输出路径
-DST_PATH = r"/data/wangzhuo/66-newdata/00-dataset/03-多属性/02-traindata/01-dinov3"
+DST_PATH = PROJECT_ROOT / "data" / "01-train_data"
 # 图片格式
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
 UNKNOWN_DEVICE_TOKENS = {"未知", "未知型号"}
@@ -99,7 +101,9 @@ def _normalize_rack(value):
     level = values[0]
     if isinstance(level, bool):
         raise ValueError(f"rack_level 不能是布尔值: {value!r}")
-    if isinstance(level, str) and level.strip().isdigit():
+    if isinstance(level, str) and level.strip() == "底板层":
+        level = 0
+    elif isinstance(level, str) and level.strip().isdigit():
         level = int(level.strip())
     elif isinstance(level, float) and level.is_integer():
         level = int(level)
@@ -160,7 +164,16 @@ def normalize_annotation(raw):
     if external or not is_oven:
         ann["rack_level"] = None
     elif "rack_level" in ann:
-        ann["rack_level"] = _normalize_rack(ann["rack_level"])
+        original = ann["rack_level"]
+        values = original if isinstance(original, list) else [original]
+        levels = {_normalize_rack(value) for value in values}
+        levels.discard(None)
+        if len(levels) > 1:
+            # 当前 Rack Head 是单分类；多层图片不能任取一层，也不应丢失其它任务标签。
+            result.setdefault("training_preparation", {})["multi_rack_level"] = copy.deepcopy(original)
+            ann["rack_level"] = None
+        else:
+            ann["rack_level"] = next(iter(levels), None)
     return result
 
 # ==================================================
@@ -200,6 +213,24 @@ def collect_pairs(src_path):
         item["output_stem"] = stem
 
     tqdm.write(f"有效样本数量: {len(pairs)}")
+    # 同图不同路径也绑定到同一划分；仅对文件大小相同的候选计算内容哈希。
+    images_by_size = defaultdict(set)
+    for item in pairs:
+        image = item["image"].resolve()
+        images_by_size[image.stat().st_size].add(image)
+    image_groups = {}
+    for images in images_by_size.values():
+        for image in images:
+            if len(images) == 1:
+                image_groups[image] = str(image)
+            else:
+                with image.open("rb") as stream:
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                    image_groups[image] = "sha256:" + digest.hexdigest()
+    for item in pairs:
+        item["image_group"] = image_groups[item["image"].resolve()]
     return pairs
 
 
@@ -224,10 +255,10 @@ def _split_counts(total):
 
 
 def split_dataset(data, seed=SEED):
-    """按型号分层，同一图片的多份标注绑定划分；不打乱调用方列表。"""
+    """按型号分层，同一图片的多份标注和内容相同的图片绑定划分。"""
     by_image = defaultdict(list)
     for item in data:
-        by_image[Path(item["image"]).resolve()].append(item)
+        by_image[item.get("image_group", str(Path(item["image"]).resolve()))].append(item)
     groups = defaultdict(list)
     for items in by_image.values():
         # 即使同一图片被标成不同型号，也不能让它跨 train / val / test。
@@ -294,7 +325,9 @@ def choose_output_root(dst_path, date_str):
 
 def summarize(items):
     models = Counter(item["raw"].get("annotations", item["raw"])["device_model"] or "无" for item in items)
-    return {"total": len(items), "device_model": dict(sorted(models.items())), "external_unknown": models["未知"]}
+    multi_rack = sum("multi_rack_level" in item["raw"].get("training_preparation", {}) for item in items)
+    return {"total": len(items), "device_model": dict(sorted(models.items())), "external_unknown": models["未知"],
+            "multi_rack_unsupervised": multi_rack}
 
 # ==================================================
 # main

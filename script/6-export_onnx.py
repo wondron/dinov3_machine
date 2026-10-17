@@ -166,8 +166,6 @@ def main() -> None:
     device = torch.device(args.device)
     run = load_run(args.run, device, ckpt_name=args.ckpt)
     out_dir = Path(args.out) if args.out else run.run_dir / "onnx"
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     inp = run.cfg["input"]
     model = run.model.float().eval()

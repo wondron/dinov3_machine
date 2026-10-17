@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -54,7 +55,11 @@ class GenerateTrainDataTests(unittest.TestCase):
         directory.mkdir(parents=True, exist_ok=True)
         image_name = image_name or f"{stem}.png"
         image = directory / image_name
-        image.write_bytes(self.png)
+        # 一般样本使用不同内容，重复内容测试再显式写入同一份 PNG。
+        pixels = np.frombuffer(hashlib.sha256(stem.encode("utf-8")).digest() * 2, dtype=np.uint8)[:45].reshape(3, 5, 3)
+        success, encoded = cv2.imencode(".png", pixels)
+        self.assertTrue(success)
+        image.write_bytes(encoded.tobytes())
         raw = {"annotation_version": "1.6", "annotations": copy.deepcopy(annotations)} if nested else copy.deepcopy(annotations)
         raw.update({"image": image_name, "image_name": image_name, "image_root": "/old/machine/path"})
         json_path = directory / f"{stem}.json"
@@ -143,6 +148,33 @@ class GenerateTrainDataTests(unittest.TestCase):
                 ann = GENERATOR.normalize_annotation({"device_model": "C9277A", "rack_level": value})
                 self.assertEqual(ann["rack_level"], 0)
                 self.assertIs(type(ann["rack_level"]), int)
+
+    def test_multiple_racks_preserve_sample_and_other_training_targets(self):
+        original = {"device_model": "C9277A", "food_name": "包子",
+                    "container_type": ["纸质容器"], "accessory_type": ["烤盘"],
+                    "rack_level": ["底板层", "1"]}
+        before = copy.deepcopy(original)
+        normalized = GENERATOR.normalize_annotation({"annotations": original})
+        ann = normalized["annotations"]
+        self.assertIsNone(ann["rack_level"])
+        self.assertTrue(ann["food_exist"])
+        self.assertEqual(ann["container_type"], ["纸质容器"])
+        self.assertEqual(ann["accessory_type"], ["烤盘"])
+        self.assertEqual(normalized["training_preparation"]["multi_rack_level"], ["底板层", "1"])
+        self.assertEqual(original, before)
+        self.assertEqual(GENERATOR.normalize_annotation({"device_model": "C9277A", "rack_level": ["1", "1"]})["rack_level"], 1)
+        with self.assertRaises(ValueError):
+            GENERATOR.normalize_annotation({"device_model": "C9277A", "rack_level": ["1", "错误"]})
+
+    def test_identical_image_copies_never_cross_splits(self):
+        for index in range(6):
+            self.write_sample(f"image-{index}", {"device_model": "未知"})
+            (self.src / f"image-{index}.png").write_bytes(self.png)
+        pairs = GENERATOR.collect_pairs(self.src)
+        # 这些图片路径不同、内容相同，必须整个分配到同一个 split。
+        self.assertEqual(len({item["image_group"] for item in pairs}), 1)
+        splits = GENERATOR.split_dataset(pairs)
+        self.assertEqual(sorted(map(len, splits)), [0, 0, 6])
 
     def test_invalid_json_missing_images_and_invalid_annotation_are_skipped(self):
         valid = self.write_sample("valid", {"device_model": "未知"})
